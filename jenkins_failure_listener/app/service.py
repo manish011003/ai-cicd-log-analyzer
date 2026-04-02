@@ -1,9 +1,9 @@
 import logging
 from datetime import UTC, datetime, timedelta
 
-from app.checkpoint_store import CheckpointStore
 from app.dispatcher import WorkerDispatcher
 from app.jenkins_client import JenkinsClient
+from app.postgres_state_store import PostgresStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +13,12 @@ class FailureMonitorService:
         self,
         jenkins_client: JenkinsClient,
         dispatcher: WorkerDispatcher,
-        checkpoint_store: CheckpointStore,
+        state_store: PostgresStateStore,
         initial_lookback_minutes: int,
     ) -> None:
         self.jenkins_client = jenkins_client
         self.dispatcher = dispatcher
-        self.checkpoint_store = checkpoint_store
+        self.state_store = state_store
         self.initial_lookback_minutes = initial_lookback_minutes
         self.started_at = datetime.now(UTC)
 
@@ -35,17 +35,19 @@ class FailureMonitorService:
             job = item["job_full_name"]
             number = item["build_number"]
             build_url = item["build_url"]
-            last_seen = self.checkpoint_store.get_last_build(job)
-            if number <= last_seen:
+            if not self.state_store.should_process(job, number):
                 continue
 
-            processed += 1
-            event = self.jenkins_client.build_failure_event(job, number, build_url)
-            self.dispatcher.send_failure_event(event)
-            forwarded += 1
-            self.checkpoint_store.mark_build(job, number)
-
-            logger.info("Forwarded failure event: %s #%s (%s)", job, number, event.event_type)
+            try:
+                processed += 1
+                event = self.jenkins_client.build_failure_event(job, number, build_url)
+                self.dispatcher.send_failure_event(event)
+                forwarded += 1
+                self.state_store.mark_processed(job, number)
+                logger.info("Forwarded failure event: %s #%s (%s)", job, number, event.event_type)
+            except Exception as exc:  # noqa: BLE001
+                self.state_store.mark_failed(job, number, str(exc))
+                raise
 
         return {"processed": processed, "forwarded": forwarded}
 

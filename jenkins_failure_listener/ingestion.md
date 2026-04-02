@@ -8,13 +8,13 @@ It polls Jenkins failed-build RSS, resolves failed stages via Pipeline APIs, and
 - No per-job Jenkinsfile changes
 - Only failure events are ingested
 - Stage-level context is still recovered using Jenkins APIs
-- Idempotent processing through checkpointing
+- Idempotent processing through Postgres state tracking
 
 ## Flow
 
 1. Poll `JENKINS_BASE_URL + JENKINS_FAILED_RSS_PATH` (default `/rssFailed`)
 2. Parse failed `job_full_name` and `build_number`
-3. Skip if build already processed (checkpoint file)
+3. Skip if build already processed (Postgres state table)
 4. Fetch:
    - Build metadata: `.../<build>/api/json`
    - Stage summary: `.../<build>/wfapi/describe`
@@ -64,7 +64,7 @@ When no failed stage node is available, `event_type` becomes `build_failure` and
 
 ## Operational notes
 
-- Keep `CHECKPOINT_FILE` on durable storage in production.
+- Keep `DATABASE_URL` configured to a durable Postgres instance in production.
 - Use a service Jenkins user with read-only permissions to jobs and pipeline metadata.
 - Put this service behind process supervisor (systemd, container restart policy, etc).
 - If RSS misses data in your Jenkins setup, you can add an API fallback poller in `JenkinsClient`.

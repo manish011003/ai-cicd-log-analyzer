@@ -12,7 +12,9 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: int = Field(default=20, alias="POLL_INTERVAL_SECONDS")
     initial_lookback_minutes: int = Field(default=60, alias="INITIAL_LOOKBACK_MINUTES")
-    checkpoint_file: str = Field(default="./checkpoints.json", alias="CHECKPOINT_FILE")
+    steady_lookback_minutes: int = Field(default=5, alias="STEADY_LOOKBACK_MINUTES")
+    database_url: str = Field(alias="DATABASE_URL")
+    state_retention_days: int = Field(default=30, alias="STATE_RETENTION_DAYS")
 
     worker_ingest_url: str = Field(alias="WORKER_INGEST_URL")
     worker_ingest_api_key: str = Field(alias="WORKER_INGEST_API_KEY")

@@ -2,10 +2,10 @@ import logging
 
 from fastapi import FastAPI
 
-from app.checkpoint_store import CheckpointStore
 from app.config import settings
 from app.dispatcher import WorkerDispatcher
 from app.jenkins_client import JenkinsClient
+from app.postgres_state_store import PostgresStateStore
 from app.service import FailureMonitorService
 
 logging.basicConfig(level=logging.INFO)
@@ -25,12 +25,13 @@ dispatcher = WorkerDispatcher(
     worker_ingest_api_key=settings.worker_ingest_api_key,
     timeout_seconds=settings.request_timeout_seconds,
 )
-checkpoint_store = CheckpointStore(settings.checkpoint_file)
+state_store = PostgresStateStore(settings.database_url)
 service = FailureMonitorService(
     jenkins_client=jenkins_client,
     dispatcher=dispatcher,
-    checkpoint_store=checkpoint_store,
+    state_store=state_store,
     initial_lookback_minutes=settings.initial_lookback_minutes,
+    steady_lookback_minutes=settings.steady_lookback_minutes,
 )
 
 
@@ -42,3 +43,9 @@ def health() -> dict:
 @app.post("/poll-once")
 def poll_once() -> dict:
     return service.poll_once()
+
+
+@app.post("/maintenance/purge-state")
+def purge_state() -> dict:
+    deleted = state_store.purge_processed_older_than_days(settings.state_retention_days)
+    return {"deleted": deleted, "retention_days": settings.state_retention_days}
