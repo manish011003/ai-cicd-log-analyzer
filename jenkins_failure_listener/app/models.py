@@ -12,12 +12,14 @@ class FailedStage(BaseModel):
 
 
 class FailureEvent(BaseModel):
+    """Field order is serialization order: small metadata first, bulky log excerpts last."""
+
     event_type: Literal["stage_failure", "build_failure"]
     jenkins_url: str
     job_full_name: str
     build_number: int
     build_url: str
     build_result: str
-    failed_stages: list[FailedStage] = Field(default_factory=list)
     timestamp: datetime
     correlation_id: str
+    failed_stages: list[FailedStage] = Field(default_factory=list)

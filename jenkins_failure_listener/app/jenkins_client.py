@@ -1,12 +1,171 @@
+import html as html_mod
+import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
+from functools import lru_cache
 from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
 
 from app.models import FailedStage, FailureEvent
+
+logger = logging.getLogger(__name__)
+
+_HTML_TAG = re.compile(r"<[^>]+>")
+_JENKINS_TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}\s+", re.MULTILINE)
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags / entities that Jenkins wfapi injects."""
+    text = _HTML_TAG.sub("", text)
+    text = html_mod.unescape(text)
+    text = _JENKINS_TS_PREFIX.sub("", text)
+    return text
+
+
+@lru_cache(maxsize=1)
+def _log_error_pattern_bundle() -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+    typed_throwable = re.compile(r"(?i)\b[A-Z][a-zA-Z0-9_]*(?:Error|Exception)\b")
+    _throwable_raw = r"\b[A-Z][a-zA-Z0-9_]*(?:Error|Exception)\b"
+    failure_signal = re.compile(
+        r"(?i)(?:"
+        r"\b(?:fatal|failure|failures|failed|failing)\b|"
+        r"\b(?:exception|exceptions|traceback)\b|"
+        r"\bpanic(?:ked)?\b|"
+        r"^\s*Error:\s+|"
+        r"\b(?:error|err)\b\s*[:!\[\]]|"
+        r"\[(?:ERROR|FATAL|CRITICAL)\]|"
+        r"\b(?:denied|forbidden|unauthorized|unauthorised)\b|"
+        r"(?:^|\s)(?:exit|return)\s*(?:code|status)?\s*[:=]\s*[1-9]\d*|"
+        r"script returned exit code\s*[1-9]|"
+        r"\bnon-zero\s+exit\b|"
+        r"\bFAILED\b|"
+        r"\b(?:ECONNREFUSED|ETIMEDOUT|ENOTFOUND|ECONNRESET)\b|"
+        r"\b(?:could not|couldn't|unable to)\s+(?:connect|reach|resolve|open|load)\b|"
+        r"connection\s+refused|connection\s+reset|broken\s+pipe|"
+        r"timed\s+out\s+waiting|"
+        r"\bcaused\s+by\s*:\s*\S+|"
+        r"\berror\[[A-Z0-9]+\]|"
+        r"\bassertion\s+failed\b|internal\s+compiler\s+error|"
+        r"\bsegmentation\s+fault\b|\bcore\s+dumped\b|"
+        + _throwable_raw
+        + r")",
+    )
+    boilerplate_anchor = re.compile(
+        r"(?i)"
+        r"re-run\s+maven|for\s+more\s+information\s+about|^\s*---+\s*$|"
+        r"cwiki\.apache\.org|\[help\s*1\]|full\s+debug\s+logging|"
+        r"^\s*Downloading\s|^\s*Progress\s*\(|Resolving\s+dependencies|"
+        r"^\s*\+\+\+\s",
+    )
+    operational_hint = re.compile(
+        r"(?i)\b(?:connection|timeout|timed\s+out|socket|dns|network|unreachable|"
+        r"refused|unavailable|not\s+found|no\s+such\s+file|permission\s+denied)\b"
+    )
+    return typed_throwable, failure_signal, boilerplate_anchor, operational_hint
+
+
+def _score_line_as_error_anchor(line: str) -> int | None:
+    typed_throwable, failure_signal, boilerplate_anchor, operational_hint = _log_error_pattern_bundle()
+    raw = line.strip()
+    if len(raw) < 4:
+        return None
+    if boilerplate_anchor.search(line):
+        return None
+    if not failure_signal.search(line):
+        return None
+    score = 1
+    if typed_throwable.search(line):
+        score += 4
+    elif re.search(r"(?i)\b(exception|exceptions|traceback|fatal|panic|failed|failure)\b", line):
+        score += 3
+    if re.search(r"(?i)(?:exit|return)\s*(?:code|status)?\s*[:=]\s*[1-9]", line):
+        score += 2
+    if re.search(r"(?i)script returned exit code\s*[1-9]", line):
+        score += 2
+    if re.search(r"(?i)connection\s+refused|ECONNREFUSED|ENOTFOUND|ETIMEDOUT", line):
+        score += 3
+    if operational_hint.search(line):
+        score += 2
+    if re.search(r"(?i)https?://", raw) and raw.lower().count("error") < 2:
+        score -= 2
+    if re.match(r"(?i)\s*at\s+[\w$.]+\(", raw) and not typed_throwable.search(line):
+        score -= 2
+    return score
+
+
+_LOG_NOISE_LINE = re.compile(
+    r"(?i)"
+    r"^\s*$|"
+    # [Pipeline] boilerplate
+    r"^\s*\[Pipeline\]\s*(?:\{|\}|//\s*\w+|$)|"
+    r"^\s*\[Pipeline\]\s*(?:stage|node|parallel|withEnv|timestamps|timeout|getContext|End of Pipeline)\b|"
+    # Maven / Gradle progress lines with no error value
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*[-=]{4,}\s*$|"
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*$|"
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*(?:Scanning for projects|"
+    r"Building\s|Compiling\s|Copying\s|Installing\s|Deleting\s|Recompiling\s|"
+    r"Downloaded\s|Downloading\s|Progress\s|Resolving\s|"
+    r"--- \S+:\S+:\S+ .* ---\s*$|"
+    r"BUILD SUCCESS|Total time:|Finished at:)|"
+    # Maven WARNING lines about dependency model / pom issues
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[WARNING\]\s*(?:$|'dependencies|"
+    r"Some problems were|It is highly recommended|"
+    r"\s*from pom\.xml)|"
+    # Bare timestamp-only or marker-only lines
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?(?:Started by|Running in|"
+    r"Checking out Revision|using credential|"
+    r"\> git\s|Cloning repository)\b"
+)
+
+
+def _cluster_sorted_indices(sorted_indices: list[int], merge_gap: int) -> list[tuple[int, int]]:
+    if not sorted_indices:
+        return []
+    clusters: list[tuple[int, int]] = []
+    start = prev = sorted_indices[0]
+    for x in sorted_indices[1:]:
+        if x - prev <= merge_gap:
+            prev = x
+        else:
+            clusters.append((start, prev))
+            start = prev = x
+    clusters.append((start, prev))
+    return clusters
+
+
+def _truncate_log_chars(text: str, max_chars: int) -> str:
+    """Bound excerpt size while keeping both the start and end of the text.
+
+    Using only ``text[-max_chars:]`` hid pipeline / command context and made excerpts
+    appear to begin mid-stack-trace (e.g. ``Connector`` shown as ``nnector``).
+    """
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    inner = max(200, max_chars - 96)
+    head = max(80, int(inner * 0.55))
+    tail = max(80, inner - head)
+    for _ in range(40):
+        omitted = max(0, len(text) - head - tail)
+        notice = f"\n... [{omitted} characters omitted; increase MAX_STAGE_LOG_CHARS] ...\n"
+        total = head + len(notice) + tail
+        if total <= max_chars:
+            spare = max_chars - total
+            head += spare // 2
+            tail += spare - spare // 2
+            omitted = max(0, len(text) - head - tail)
+            notice = f"\n... [{omitted} characters omitted; increase MAX_STAGE_LOG_CHARS] ...\n"
+            out = text[:head] + notice + text[-tail:]
+            if len(out) <= max_chars:
+                return out
+            return text[: max_chars - 3] + "..."
+        head = max(40, head - 30)
+        tail = max(40, tail - 30)
+    return text[: max_chars - 3] + "..."
 
 
 class JenkinsClient:
@@ -17,11 +176,25 @@ class JenkinsClient:
         api_token: str,
         failed_rss_path: str,
         timeout_seconds: int = 30,
-        max_stage_log_chars: int = 30000,
+        max_stage_log_chars: int = 50000,
+        max_stage_scan_lines: int = 1200,
+        per_error_context_before: int = 2,
+        per_error_context_after: int = 4,
+        error_anchor_merge_gap_lines: int = 3,
+        max_error_regions_per_stage: int = 15,
+        min_anchor_score_for_snippet: int = 2,
+        parallel_stage_overlap_ms: int = 2000,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.failed_rss_path = failed_rss_path
         self.max_stage_log_chars = max_stage_log_chars
+        self.max_stage_scan_lines = max_stage_scan_lines
+        self.per_error_context_before = per_error_context_before
+        self.per_error_context_after = per_error_context_after
+        self.error_anchor_merge_gap_lines = error_anchor_merge_gap_lines
+        self.max_error_regions_per_stage = max_error_regions_per_stage
+        self.min_anchor_score_for_snippet = min_anchor_score_for_snippet
+        self.parallel_stage_overlap_ms = parallel_stage_overlap_ms
         self.client = httpx.Client(
             auth=(user, api_token),
             timeout=timeout_seconds,
@@ -32,64 +205,40 @@ class JenkinsClient:
     def _job_path(job_full_name: str) -> str:
         return "/".join([f"job/{quote(part, safe='')}" for part in job_full_name.split("/")])
 
-    def list_failed_builds_from_rss(self, lookback_minutes: int) -> list[dict]:
+    def list_failed_builds_from_rss(self) -> list[dict]:
+        """Parse the Jenkins failed-builds RSS/Atom feed. No time filtering.
+
+        The RSS feed is naturally bounded by Jenkins (last ~20 entries).
+        Callers should filter by build_number using Postgres state.
+        """
         url = f"{self.base_url}{self.failed_rss_path}"
         response = self.client.get(url)
         response.raise_for_status()
 
         root = ET.fromstring(response.text)
-        cutoff = datetime.now(UTC) - timedelta(minutes=lookback_minutes)
         items: list[dict] = []
-        # Jenkins may return RSS 2.0 (channel/item) or Atom (feed/entry).
+
         if root.tag.endswith("feed"):
             atom_ns = {"atom": "http://www.w3.org/2005/Atom"}
             for entry in root.findall("./atom:entry", atom_ns):
                 title = (entry.findtext("atom:title", default="", namespaces=atom_ns) or "").strip()
                 link_el = entry.find("atom:link", atom_ns)
                 link = (link_el.get("href", "") if link_el is not None else "").strip()
-                published_raw = (entry.findtext("atom:published", default="", namespaces=atom_ns) or "").strip()
                 if not title or not link:
                     continue
-
-                pub_date = self._parse_datetime(published_raw)
-                if pub_date < cutoff:
-                    continue
-
                 parsed = self._parse_title_and_link(title, link)
                 if parsed:
-                    parsed["published_at"] = pub_date.isoformat()
                     items.append(parsed)
         else:
             for item in root.findall("./channel/item"):
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "").strip()
-                pub_date_raw = (item.findtext("pubDate") or "").strip()
                 if not title or not link:
                     continue
-
-                pub_date = self._parse_datetime(pub_date_raw)
-                if pub_date < cutoff:
-                    continue
-
                 parsed = self._parse_title_and_link(title, link)
                 if parsed:
-                    parsed["published_at"] = pub_date.isoformat()
                     items.append(parsed)
         return items
-
-    @staticmethod
-    def _parse_datetime(value: str) -> datetime:
-        if not value:
-            return datetime.now(UTC)
-        for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%dT%H:%M:%SZ"):
-            try:
-                dt = datetime.strptime(value, fmt)
-                if dt.tzinfo is None:
-                    return dt.replace(tzinfo=UTC)
-                return dt.astimezone(UTC)
-            except ValueError:
-                continue
-        return datetime.now(UTC)
 
     @staticmethod
     def _parse_title_and_link(title: str, link: str) -> dict | None:
@@ -123,13 +272,16 @@ class JenkinsClient:
 
         data = response.json()
         stages = data.get("stages", [])
+
+        root_failures = self._select_root_failure_stages(stages)
+        if not root_failures:
+            return []
+
         failed: list[FailedStage] = []
         console_text: str | None = None
 
-        for stage in stages:
-            status = str(stage.get("status", "")).upper()
-            if status not in {"FAILED", "ERROR", "ABORTED"}:
-                continue
+        for stage in root_failures:
+            stage_status = str(stage.get("status", "")).upper()
             stage_id = str(stage.get("id")) if stage.get("id") is not None else None
             stage_name = str(stage.get("name", "unknown-stage"))
             excerpt = self._stage_log_excerpt(job_full_name, build_number, stage_id, stage_name)
@@ -141,11 +293,38 @@ class JenkinsClient:
                 FailedStage(
                     stage_name=stage_name,
                     stage_id=stage_id,
-                    status=status,
+                    status=stage_status,
                     log_excerpt=excerpt,
                 )
             )
         return failed
+
+    def _select_root_failure_stages(self, stages: list[dict]) -> list[dict]:
+        """Return the earliest failed stage and any parallel siblings that failed
+        within ``parallel_stage_overlap_ms`` of it.
+
+        If the first failure sits inside a parallel block, other branches that
+        started around the same time are included so the caller sees every
+        independent failure.  Sequential (non-parallel) cascade stages are
+        excluded.
+        """
+        error_statuses = {"FAILED", "ERROR", "ABORTED"}
+        failed = [
+            s for s in stages if str(s.get("status", "")).upper() in error_statuses
+        ]
+        if not failed:
+            return []
+
+        failed.sort(key=lambda s: int(s.get("startTimeMillis") or 0))
+        earliest = failed[0]
+        earliest_start = int(earliest.get("startTimeMillis") or 0)
+
+        result = [earliest]
+        for s in failed[1:]:
+            s_start = int(s.get("startTimeMillis") or 0)
+            if abs(s_start - earliest_start) <= self.parallel_stage_overlap_ms:
+                result.append(s)
+        return result
 
     def _stage_log_excerpt(
         self, job_full_name: str, build_number: int, stage_id: str | None, stage_name: str
@@ -153,26 +332,66 @@ class JenkinsClient:
         if not stage_id:
             return ""
         job_path = self._job_path(job_full_name)
+        tag = f"{job_full_name}#{build_number} stage={stage_name}"
 
-        # 1) Preferred endpoint: wfapi node log
-        wfapi_log_url = f"{self.base_url}/{job_path}/{build_number}/execution/node/{stage_id}/wfapi/log"
-        wfapi_response = self.client.get(wfapi_log_url)
-        if wfapi_response.status_code < 400:
-            wfapi_data = wfapi_response.json()
-            wfapi_text = str(wfapi_data.get("text", "")).strip()
-            if wfapi_text:
-                return self._smart_excerpt(wfapi_text, stage_name)
+        text = self._fetch_node_log_text(job_path, build_number, stage_id)
+        if text:
+            logger.info("%s: using stage node log (%d chars)", tag, len(text))
+            return self._stage_error_snippets(text)
 
-        # 2) Fallback endpoint: classic node raw log
-        raw_log_url = f"{self.base_url}/{job_path}/{build_number}/execution/node/{stage_id}/log/?start=0"
-        raw_response = self.client.get(raw_log_url)
-        if raw_response.status_code < 400:
-            raw_text = raw_response.text.strip()
-            if raw_text and "not found" not in raw_text.lower():
-                return self._smart_excerpt(raw_text, stage_name)
+        # Parent stage node returned empty -- walk stageFlowNodes children.
+        child_text = self._fetch_child_node_logs(job_path, build_number, stage_id)
+        if child_text:
+            logger.info("%s: using child node logs (%d chars)", tag, len(child_text))
+            return self._stage_error_snippets(child_text)
 
-        # 3) Final fallback handled by caller via consoleText extraction.
+        logger.info("%s: no stage-scoped log, falling back to consoleText", tag)
         return ""
+
+    def _fetch_node_log_text(self, job_path: str, build_number: int, node_id: str) -> str:
+        """Try wfapi/log for a single node, return cleaned text or empty string."""
+        url = f"{self.base_url}/{job_path}/{build_number}/execution/node/{node_id}/wfapi/log"
+        try:
+            resp = self.client.get(url)
+            if resp.status_code < 400:
+                data = resp.json()
+                raw = str(data.get("text", "")).strip()
+                if raw:
+                    return _strip_html(raw)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _fetch_child_node_logs(self, job_path: str, build_number: int, stage_id: str) -> str:
+        """Discover stageFlowNodes for a stage and concatenate their logs."""
+        desc_url = f"{self.base_url}/{job_path}/{build_number}/execution/node/{stage_id}/wfapi/describe"
+        try:
+            resp = self.client.get(desc_url)
+            if resp.status_code >= 400:
+                return ""
+            children = resp.json().get("stageFlowNodes", [])
+        except Exception:  # noqa: BLE001
+            return ""
+
+        parts: list[str] = []
+        for child in children:
+            cid = str(child.get("id", ""))
+            if not cid:
+                continue
+            text = self._fetch_node_log_text(job_path, build_number, cid)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _has_real_error_signals(text: str) -> bool:
+        if not text:
+            return False
+        _, failure_signal, _, _ = _log_error_pattern_bundle()
+        for line in text.splitlines()[:200]:
+            if failure_signal.search(line):
+                return True
+        return False
 
     def _build_console_text(self, job_full_name: str, build_number: int) -> str:
         job_path = self._job_path(job_full_name)
@@ -183,6 +402,12 @@ class JenkinsClient:
         return response.text or ""
 
     def _extract_stage_excerpt_from_console(self, console_text: str, stage_name: str) -> str:
+        """Extract error snippets from consoleText, narrowing to the stage section when possible.
+
+        First tries to locate the stage by ``(stage_name)`` markers that Jenkins Pipeline
+        emits, then runs error-snippet extraction on that narrowed window.  Falls back to
+        the full console text only when no stage markers are found.
+        """
         if not console_text:
             return ""
 
@@ -192,57 +417,95 @@ class JenkinsClient:
 
         marker = f"({stage_name})"
         indices = [idx for idx, line in enumerate(lines) if marker in line or stage_name in line]
-        if not indices:
-            tail = "\n".join(lines[-120:])
-            return self._smart_excerpt(tail, stage_name)
 
-        # Use the last stage marker; failures are often near the end.
-        center = indices[-1]
-        start = max(0, center - 30)
-        end = min(len(lines), center + 120)
-        window = "\n".join(lines[start:end])
-        return self._smart_excerpt(window, stage_name)
+        if indices:
+            center = indices[-1]
+            start = max(0, center - 50)
+            end = min(len(lines), center + 150)
+            window_text = "\n".join(lines[start:end])
+            snippet = self._stage_error_snippets(window_text)
+            if snippet and self._has_real_error_signals(snippet):
+                return snippet
 
-    def _smart_excerpt(self, text: str, stage_name: str) -> str:
+        return self._stage_error_snippets(console_text)
+
+    def _stage_error_snippets(self, text: str) -> str:
+        """5-8 lines around each error signal, with overlapping windows merged.
+
+        Produces one compact region per cluster of nearby errors; regions never
+        share lines so there are no duplicates in the output.
+        """
         lines = text.splitlines()
         if not lines:
             return ""
+        n = min(len(lines), self.max_stage_scan_lines)
+        bounded = lines[:n]
+        before = max(0, self.per_error_context_before)
+        after = max(0, self.per_error_context_after)
+        merge_gap = max(0, self.error_anchor_merge_gap_lines)
+        min_score = self.min_anchor_score_for_snippet
 
-        max_lines = 220
-        head = lines[:40]
-        tail = lines[-100:]
-        error_pattern = re.compile(
-            r"(error|exception|traceback|caused by|failed|exit code|abort|timed out)",
-            re.IGNORECASE,
-        )
-        marker_pattern = re.compile(re.escape(stage_name), re.IGNORECASE)
+        score_at: dict[int, int] = {}
+        for i in range(n):
+            sc = _score_line_as_error_anchor(bounded[i])
+            if sc is not None and sc >= min_score:
+                score_at[i] = max(score_at.get(i, 0), sc)
 
-        highlights: list[str] = []
-        for idx, line in enumerate(lines):
-            if error_pattern.search(line) or marker_pattern.search(line):
-                start = max(0, idx - 3)
-                end = min(len(lines), idx + 4)
-                highlights.extend(lines[start:end])
+        if not score_at:
+            return self._first_cause_excerpt(text)
 
-        combined: list[str] = []
-        combined.extend(head)
-        combined.append("... [highlighted snippets] ...")
-        combined.extend(highlights[:120])
-        combined.append("... [tail] ...")
-        combined.extend(tail)
+        sorted_idx = sorted(score_at)
+        clusters = _cluster_sorted_indices(sorted_idx, merge_gap)
 
-        # De-duplicate while preserving order.
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for line in combined:
-            key = line.rstrip()
-            if key in seen:
+        def cluster_peak(lo: int, hi: int) -> int:
+            return max(score_at[i] for i in range(lo, hi + 1) if i in score_at)
+
+        if len(clusters) > self.max_error_regions_per_stage:
+            ranked = sorted(
+                clusters,
+                key=lambda ch: (-cluster_peak(ch[0], ch[1]), -ch[1]),
+            )
+            clusters = sorted(ranked[: self.max_error_regions_per_stage], key=lambda ch: ch[0])
+
+        # Expand each cluster with context then merge overlapping windows.
+        windows: list[tuple[int, int]] = []
+        for lo, hi in clusters:
+            wlo = max(0, lo - before)
+            whi = min(n, hi + after + 1)
+            if windows and wlo <= windows[-1][1]:
+                windows[-1] = (windows[-1][0], max(windows[-1][1], whi))
+            else:
+                windows.append((wlo, whi))
+
+        parts: list[str] = []
+        for rank, (wlo, whi) in enumerate(windows, start=1):
+            chunk = bounded[wlo:whi]
+            cleaned = [ln for ln in chunk if ln.strip() and not _LOG_NOISE_LINE.match(ln)]
+            if not cleaned:
                 continue
-            seen.add(key)
-            deduped.append(line)
+            body = "\n".join(cleaned)
+            parts.append(f"--- error region {rank} (lines {wlo + 1}-{whi} of {n}) ---\n{body}")
 
-        excerpt = "\n".join(deduped[:max_lines]).strip()
-        return excerpt[-self.max_stage_log_chars :]
+        out = "\n\n".join(parts).strip()
+        if not out:
+            return self._first_cause_excerpt(text)
+        return _truncate_log_chars(out, self.max_stage_log_chars)
+
+    def _first_cause_excerpt(self, text: str) -> str:
+        """Fallback when no scored error anchors are found.
+
+        Returns a compact tail of the log (often contains the final error
+        message or exit status) cleaned of noise lines.
+        """
+        lines = text.splitlines()
+        if not lines:
+            return ""
+        tail = lines[-min(30, len(lines)):]
+        cleaned = [ln for ln in tail if ln.strip() and not _LOG_NOISE_LINE.match(ln)]
+        if not cleaned:
+            cleaned = [ln for ln in tail if ln.strip()]
+        result = "\n".join(cleaned[-8:])
+        return _truncate_log_chars(result, self.max_stage_log_chars)
 
     def build_failure_event(self, job_full_name: str, build_number: int, build_url: str) -> FailureEvent:
         api_data = self.build_api(job_full_name, build_number)
@@ -256,7 +519,7 @@ class JenkinsClient:
             build_number=build_number,
             build_url=build_url,
             build_result=api_data.get("result", "FAILURE"),
-            failed_stages=failed_stages,
             timestamp=datetime.now(UTC),
             correlation_id=str(uuid4()),
+            failed_stages=failed_stages,
         )

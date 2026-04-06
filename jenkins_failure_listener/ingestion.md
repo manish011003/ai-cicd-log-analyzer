@@ -19,32 +19,38 @@ It polls Jenkins failed-build RSS, resolves failed stages via Pipeline APIs, and
    - Build metadata: `.../<build>/api/json`
    - Stage summary: `.../<build>/wfapi/describe`
    - Failed stage logs: `.../execution/node/<id>/wfapi/log`
-5. Create normalized event and POST to `WORKER_INGEST_URL`
+5. Build one normalized event per new failed build (earliest failed stage only), then POST to `WORKER_INGEST_URL`.
 
-## Event shape sent to worker
+By default (`WORKER_SEND_BATCH=true`) the listener sends **one HTTP request per poll** with body:
 
 ```json
 {
-  "event_type": "stage_failure",
-  "jenkins_url": "https://jenkins.example.com",
-  "job_full_name": "folder/job-name",
-  "build_number": 123,
-  "build_url": "https://jenkins.example.com/job/folder/job/job-name/123/",
-  "build_result": "FAILURE",
-  "failed_stages": [
+  "failures": [
     {
-      "stage_name": "Unit Tests",
-      "stage_id": "45",
-      "status": "FAILED",
-      "log_excerpt": "tail of failed stage log..."
+      "event_type": "stage_failure",
+      "jenkins_url": "https://jenkins.example.com",
+      "job_full_name": "folder/job-name",
+      "build_number": 123,
+      "build_url": "https://jenkins.example.com/job/folder/job/job-name/123/",
+      "build_result": "FAILURE",
+      "timestamp": "2026-03-26T10:20:30Z",
+      "correlation_id": "uuid",
+      "failed_stages": [
+        {
+          "stage_name": "Unit Tests",
+          "stage_id": "45",
+          "status": "FAILED",
+          "log_excerpt": "tail of failed stage log..."
+        }
+      ]
     }
-  ],
-  "timestamp": "2026-03-26T10:20:30Z",
-  "correlation_id": "uuid"
+  ]
 }
 ```
 
-When no failed stage node is available, `event_type` becomes `build_failure` and `failed_stages` can be empty.
+`failed_stages` contains **at most one** stage (the chronologically first failure). Set `WORKER_SEND_BATCH=false` to POST each event separately (legacy workers).
+
+`POST /poll-once` returns `processed`, `forwarded`, and `failures` (same objects as above) in **one JSON response**.
 
 ## Setup
 

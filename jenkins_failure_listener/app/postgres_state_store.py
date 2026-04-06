@@ -29,6 +29,37 @@ class PostgresStateStore:
                     """
                 )
 
+    def release_stale_processing(self, stale_minutes: int = 30) -> int:
+        """Reset rows stuck in processing (e.g. worker killed mid-request)."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE jenkins_failure_events
+                    SET status = 'failed',
+                        last_error = 'stale processing reclaim'
+                    WHERE status = 'processing'
+                      AND first_seen_at < NOW() - (%s || ' minutes')::interval
+                    """,
+                    (stale_minutes,),
+                )
+                return cur.rowcount
+
+    def get_last_processed_build_number(self, job_full_name: str) -> int:
+        """Highest build_number we have tracked (any status) for a job, or 0."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(build_number), 0)
+                    FROM jenkins_failure_events
+                    WHERE job_full_name = %s
+                    """,
+                    (job_full_name,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+
     def claim_for_processing(self, job_full_name: str, build_number: int) -> bool:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -53,22 +84,6 @@ class PostgresStateStore:
                 )
                 row = cur.fetchone()
                 return bool(row)
-
-    def get_status(self, job_full_name: str, build_number: int) -> str | None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT status
-                    FROM jenkins_failure_events
-                    WHERE job_full_name = %s AND build_number = %s
-                    """,
-                    (job_full_name, build_number),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return None
-                return str(row[0])
 
     def mark_processed(self, job_full_name: str, build_number: int) -> None:
         with self._connect() as conn:
