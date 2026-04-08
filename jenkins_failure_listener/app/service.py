@@ -75,10 +75,11 @@ class FailureMonitorService:
                 self.state_store.mark_failed(job, number, str(exc))
                 raise
 
+        worker_analysis: dict = {}
         if events:
             if self.dispatcher.send_batch:
                 try:
-                    self.dispatcher.send_failure_events(events)
+                    worker_analysis = self.dispatcher.send_failure_events(events)
                 except Exception as exc:  # noqa: BLE001
                     for job, number, _ in claimed:
                         self.state_store.mark_failed(job, number, f"worker forward: {exc}")
@@ -86,13 +87,16 @@ class FailureMonitorService:
                 for job, number, _ in claimed:
                     self.state_store.mark_processed(job, number)
             else:
+                all_results: list = []
                 for event, (job, number, _) in zip(events, claimed, strict=True):
                     try:
-                        self.dispatcher.send_failure_events([event])
+                        resp = self.dispatcher.send_failure_events([event])
                     except Exception as exc:  # noqa: BLE001
                         self.state_store.mark_failed(job, number, f"worker forward: {exc}")
                         raise
                     self.state_store.mark_processed(job, number)
+                    all_results.extend(resp.get("results", []))
+                worker_analysis = {"status": "analyzed", "count": len(all_results), "results": all_results}
             logger.info(
                 "Forwarded %d failure(s)%s: %s",
                 len(events),
@@ -105,4 +109,5 @@ class FailureMonitorService:
             "processed": forwarded,
             "forwarded": forwarded,
             "failures": [e.model_dump(mode="json") for e in events],
+            "analysis": worker_analysis,
         }
