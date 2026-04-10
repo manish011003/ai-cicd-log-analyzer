@@ -166,6 +166,7 @@ async def ingest_failure(
                 "fingerprint": state.get("fingerprint", ""),
                 "filtered_logs": state.get("filtered_logs", ""),
                 "analysis": state.get("analysis", ""),
+                "suggested_fix": state.get("suggested_fix", ""),
                 "recommendation": state.get("recommendation", ""),
                 "match_score": state.get("match_score", 0),
                 "matched_solution": state.get("matched_solution", ""),

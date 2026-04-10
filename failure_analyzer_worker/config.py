@@ -29,9 +29,9 @@ class WorkerSettings(BaseSettings):
         default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL"
     )
 
-    # LLM (Google Gemini)
-    google_api_key: str = Field(default="", alias="GOOGLE_API_KEY")
-    llm_model: str = Field(default="gemini-2.0-flash", alias="LLM_MODEL")
+    # LLM (Groq)
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    llm_model: str = Field(default="llama-3.3-70b-versatile", alias="LLM_MODEL")
     llm_temperature: float = Field(default=0.1, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=2048, alias="LLM_MAX_TOKENS")
 

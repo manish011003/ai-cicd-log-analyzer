@@ -13,10 +13,12 @@ whether Elasticsearch returned any solutions above the similarity threshold.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, TypedDict
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
 from . import log_processor
@@ -42,6 +44,7 @@ class AnalysisState(TypedDict, total=False):
     es_matches: list[dict[str, Any]]
     # --- outputs ---
     analysis: str
+    suggested_fix: str
     recommendation: str
     matched_solution: str
     match_score: float
@@ -52,9 +55,10 @@ class AnalysisState(TypedDict, total=False):
 # ===================================================================
 
 _SYSTEM_PROMPT = (
-    "You are a CI/CD failure analyst. You help developers quickly understand "
-    "and resolve Jenkins build failures. Be concise, precise, and actionable. "
-    "Structure your answer with clear headings."
+    "You are a senior CI/CD failure analyst. You help developers understand "
+    "and resolve Jenkins build failures. Give concise, actionable answers "
+    "with step-by-step fix instructions. Include exact commands and file "
+    "changes. Keep the total response under 400 words. Use markdown headings."
 )
 
 _WITH_CONTEXT_TEMPLATE = """\
@@ -75,11 +79,13 @@ past error with its known resolution.
 {past_solution}
 
 Instructions:
-1. Determine whether this is the same or a closely related issue.
-2. If applicable, state whether the past resolution applies and note any \
-adjustments needed for the current failure.
-3. Provide specific, actionable fix steps for the developer.
-Keep the response under 400 words."""
+1. **Analysis** – a short paragraph explaining what went wrong, why it happened, \
+and whether the past resolution applies (note any adjustments needed).
+2. **Step-by-Step Fix** – numbered steps with exact commands or file changes \
+in code blocks. Each step should be clear enough to follow without guessing.
+3. **Verify** – one command or check to confirm the fix worked.
+
+Keep the total response under 400 words."""
 
 _FRESH_TEMPLATE = """\
 A Jenkins build has failed. Below are the filtered error logs.
@@ -93,10 +99,14 @@ A Jenkins build has failed. Below are the filtered error logs.
 ```
 
 Analyze the failure and provide:
-1. **Root Cause** – what went wrong.
-2. **Explanation** – brief technical context.
-3. **Recommended Fix** – specific, actionable steps.
-Keep the response under 400 words."""
+
+1. **Analysis** – a short paragraph explaining what went wrong and why, with \
+enough technical context for the developer to understand the issue.
+2. **Step-by-Step Fix** – numbered steps with exact commands or file changes \
+in code blocks. Each step should be clear enough to follow without guessing.
+3. **Verify** – one command or check to confirm the fix worked.
+
+Keep the total response under 400 words."""
 
 
 # ===================================================================
@@ -133,12 +143,31 @@ def _route(state: AnalysisState) -> str:
     return "analyze_fresh"
 
 
-def _get_llm() -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
+def _split_response(content: str) -> tuple[str, str]:
+    """Split LLM response into (analysis, suggested_fix).
+
+    Looks for the first '## Step-by-Step Fix' or '## Step-by-step Fix' heading
+    and splits there. Everything before is analysis, everything from that
+    heading onward is the suggested fix.
+    """
+    pattern = re.compile(
+        r"(?m)^#{1,6}\s*Step-by-Step\s+Fix",
+        re.IGNORECASE,
+    )
+    match = pattern.search(content)
+    if match:
+        return content[:match.start()].strip(), content[match.start():].strip()
+    return content.strip(), ""
+
+
+def _get_llm() -> ChatGroq:
+    http_client = httpx.Client(verify=False)
+    return ChatGroq(
         model=settings.llm_model,
         temperature=settings.llm_temperature,
-        max_output_tokens=settings.llm_max_tokens,
-        google_api_key=settings.google_api_key,
+        max_tokens=settings.llm_max_tokens,
+        groq_api_key=settings.groq_api_key,
+        http_client=http_client,
     )
 
 
@@ -159,8 +188,10 @@ def analyze_with_context(state: AnalysisState) -> dict:
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
+    analysis, suggested_fix = _split_response(resp.content)
     return {
-        "analysis": resp.content,
+        "analysis": analysis,
+        "suggested_fix": suggested_fix,
         "matched_solution": best.get("solution", ""),
         "match_score": best.get("score", 0.0),
         "recommendation": "verified_past_solution",
@@ -180,8 +211,10 @@ def analyze_fresh(state: AnalysisState) -> dict:
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
+    analysis, suggested_fix = _split_response(resp.content)
     return {
-        "analysis": resp.content,
+        "analysis": analysis,
+        "suggested_fix": suggested_fix,
         "matched_solution": "",
         "match_score": 0.0,
         "recommendation": "fresh_analysis",
