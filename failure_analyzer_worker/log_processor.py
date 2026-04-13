@@ -39,6 +39,11 @@ _TIMESTAMP_STRIP = re.compile(
 )
 
 # ===================================================================
+# ANSI escape codes – stripped inline (not whole-line discard)
+# ===================================================================
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# ===================================================================
 # Noise lines – entire line is discarded if matched
 # ===================================================================
 _NOISE_LINE = re.compile(
@@ -84,6 +89,21 @@ _NOISE_LINE = re.compile(
     r"yarn install|Resolving packages|Fetching packages|"
     r"Linking dependencies|Building fresh packages)|"
 
+    # Python pip / virtualenv noise
+    r"^\s*(?:Requirement already satisfied|Collecting\s|Using cached\s|Installing collected|Successfully installed|"
+    r"Creating virtualenv|Activating virtualenv|pip install)\b|"
+
+    # Go build / test noise
+    r"^\s*(?:go: downloading\s|go: extracting\s|ok\s+\S+\s+\d+\.\d+s|"
+    r"\?\s+\S+\s+\[no test files\])|"
+
+    # Terraform noise
+    r"^\s*(?:Terraform has been|Initializing provider|Initializing modules|"
+    r"Terraform will perform|Plan:\s+\d+ to add)|"
+
+    # Rust / Cargo noise
+    r"^\s*(?:Compiling\s+\S+\s+v|Downloading\s+crates|Updating\s+crates\.io)|"
+
     # Generic CI markers with no diagnostic value
     r"^\s*(?:Started by|Running in|Established SSH|"
     r"\+\s*(?:echo|export|cd|mkdir|chmod|set)\s)"
@@ -95,6 +115,8 @@ _NOISE_LINE = re.compile(
 _EXCEPTION_CLASS = re.compile(
     r"\b([a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*"
     r"(?:Exception|Error|Failure|Fault))\b"
+    r"(?![\w$]*(?:Handler|Formatter|Factory|Builder|Callback|Listener|Logger|"
+    r"Writer|Reader|Config|Code|Message|Page|Response|Boundary))"
 )
 _CAUSED_BY = re.compile(
     r"Caused\s+by:\s*(\S+(?:Exception|Error|Failure|Fault)\b[^\n]*)",
@@ -103,6 +125,11 @@ _CAUSED_BY = re.compile(
 _ERROR_LINE = re.compile(
     r"(?:^|\s)(?:ERROR|FATAL|SEVERE)\s+(.+)", re.IGNORECASE
 )
+_PYTHON_TRACEBACK = re.compile(r"Traceback \(most recent call last\):")
+_PYTHON_FINAL_ERROR = re.compile(
+    r"^([A-Z]\w*(?:Error|Exception|Warning))\s*:?\s*(.*)", re.MULTILINE
+)
+_GO_PANIC = re.compile(r"^panic:\s*(.+)", re.MULTILINE)
 _KEY_SIGNAL = re.compile(
     r"(?i)\b(?:"
     r"connection\s+refused|connection\s+reset|connection\s+timed?\s*out|"
@@ -116,7 +143,11 @@ _KEY_SIGNAL = re.compile(
     r"not\s+found|timed?\s*out|refused|"
     r"exit\s+code\s*[:=]?\s*[1-9]\d*|"
     r"non-zero\s+exit|returned\s+exit\s+code|"
-    r"assert(?:ion)?(?:\s+(?:failed|error))?"
+    r"assert(?:ion)?(?:\s+(?:failed|error))?|"
+    r"command\s+not\s+found|syntax\s+error\s+near|"
+    r"no\s+such\s+file\s+or\s+directory|"
+    r"image\s+pull\s+back\s*off|crash\s*loop\s*back\s*off|"
+    r"exec\s+format\s+error"
     r")\b"
 )
 
@@ -132,18 +163,38 @@ _es_client: Elasticsearch | None = None
 # ===================================================================
 
 def filter_logs(raw_text: str) -> str:
-    """Strip timestamps, CI boilerplate, and package-download noise."""
+    """Strip timestamps, ANSI codes, CI boilerplate, and collapse duplicates."""
     out: list[str] = []
     prev_blank = False
+    prev_line: str | None = None
+    dup_count = 0
 
     for line in raw_text.splitlines():
         cleaned = _TIMESTAMP_STRIP.sub("", line).rstrip()
+        cleaned = _ANSI_ESCAPE.sub("", cleaned)
         if _NOISE_LINE.match(cleaned):
             if not prev_blank and out:
                 prev_blank = True
             continue
         prev_blank = False
+
+        if cleaned == prev_line:
+            dup_count += 1
+            if dup_count < 2:
+                out.append(cleaned)
+            continue
+
+        if dup_count >= 2:
+            extra = dup_count - 1
+            out.append(f"... ({extra} more identical line{'s' if extra != 1 else ''})")
+
+        prev_line = cleaned
+        dup_count = 0
         out.append(cleaned)
+
+    if dup_count >= 2:
+        extra = dup_count - 1
+        out.append(f"... ({extra} more identical line{'s' if extra != 1 else ''})")
 
     return "\n".join(out).strip()
 
@@ -152,7 +203,9 @@ def filter_logs(raw_text: str) -> str:
 # Public: fingerprint generation
 # ===================================================================
 
-def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
+def generate_fingerprint(
+    filtered_logs: str, stage_name: str, error_class: str = ""
+) -> str:
     """Build a compact, searchable fingerprint from error signals + stage name."""
     exception_types: list[str] = []
     caused_by_msgs: list[str] = []
@@ -182,7 +235,27 @@ def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
             if sig not in key_signals:
                 key_signals.append(sig)
 
+    if _PYTHON_TRACEBACK.search(filtered_logs):
+        for m in _PYTHON_FINAL_ERROR.finditer(filtered_logs):
+            short = m.group(1)
+            if short not in seen_exceptions:
+                seen_exceptions.add(short)
+                exception_types.append(short)
+            if not caused_by_msgs:
+                msg = m.group(2).strip()
+                if msg:
+                    caused_by_msgs.append(msg[:200])
+
+    if not exception_types:
+        for m in _GO_PANIC.finditer(filtered_logs):
+            exception_types.append("panic")
+            if not caused_by_msgs:
+                caused_by_msgs.append(m.group(1).strip()[:200])
+            break
+
     parts: list[str] = [f"stage:{stage_name}"]
+    if error_class and error_class != "unknown":
+        parts.append(f"class:{error_class}")
     if exception_types:
         parts.append("exceptions: " + ", ".join(exception_types[:10]))
     if caused_by_msgs:

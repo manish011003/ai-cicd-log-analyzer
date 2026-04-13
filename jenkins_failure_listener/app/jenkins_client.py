@@ -50,6 +50,7 @@ def _log_error_pattern_bundle() -> tuple[re.Pattern[str], re.Pattern[str], re.Pa
         r"\berror\[[A-Z0-9]+\]|"
         r"\bassertion\s+failed\b|internal\s+compiler\s+error|"
         r"\bsegmentation\s+fault\b|\bcore\s+dumped\b|"
+        r"\b(?:CrashLoopBackOff|ImagePullBackOff|ErrImagePull|OOMKilled)\b|"
         + _throwable_raw
         + r")",
     )
@@ -89,10 +90,29 @@ def _score_line_as_error_anchor(line: str) -> int | None:
         score += 3
     if operational_hint.search(line):
         score += 2
+    # Python traceback markers
+    if re.search(r"(?i)Traceback \(most recent call last\):", line):
+        score += 4
+    if re.search(r'^\s*File\s+"[^"]+",\s+line\s+\d+', line):
+        score += 1
+    # Go panic
+    if re.search(r"^panic:", line):
+        score += 4
+    # Terraform / Ansible
+    if re.search(r"(?i)^\s*Error:\s+.{10,}", line):
+        score += 3
+    if re.search(r"(?i)^fatal:\s+\[", line):
+        score += 3
+    # Kubernetes pod errors
+    if re.search(r"(?i)CrashLoopBackOff|ImagePullBackOff|ErrImagePull|OOMKilled", line):
+        score += 3
     if re.search(r"(?i)https?://", raw) and raw.lower().count("error") < 2:
         score -= 2
     if re.match(r"(?i)\s*at\s+[\w$.]+\(", raw) and not typed_throwable.search(line):
         score -= 2
+    # Informational lines that contain operational keywords but aren't errors
+    if re.search(r"(?i)(?:established|succeeded|healthy|ready|started successfully|connected to)", line):
+        score -= 3
     return score
 
 
