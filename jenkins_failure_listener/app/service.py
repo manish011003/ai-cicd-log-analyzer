@@ -19,7 +19,7 @@ class FailureMonitorService:
         self.dispatcher = dispatcher
         self.state_store = state_store
 
-    def poll_once(self) -> dict[str, int]:
+    def poll_once(self) -> dict:
         self.state_store.release_stale_processing(stale_minutes=30)
 
         all_failed = self.jenkins_client.list_failed_builds_from_rss()

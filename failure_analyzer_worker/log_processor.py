@@ -1,17 +1,11 @@
-"""Log filtering, fingerprint generation, and Elasticsearch operations.
-
-This module owns three concerns that feed the LangGraph analysis pipeline:
-  1. filter_logs        – strip timestamps, CI boilerplate, package downloads
-  2. generate_fingerprint – extract error signals into a compact search key
-  3. ES helpers         – embed fingerprints with all-MiniLM, knn-search, store
-"""
+"""Log filtering, fingerprinting, and Elasticsearch (embeddings + knn + store)."""
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from elasticsearch import Elasticsearch
@@ -21,9 +15,6 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# ===================================================================
-# Timestamp patterns – stripped from the *beginning* of every line
-# ===================================================================
 _TIMESTAMP_STRIP = re.compile(
     r"^(?:"
     # ISO-8601  2026-04-06T05:59:53.123Z  or  [2026-04-06T05:59:53.123Z]
@@ -38,9 +29,6 @@ _TIMESTAMP_STRIP = re.compile(
     r")"
 )
 
-# ===================================================================
-# Noise lines – entire line is discarded if matched
-# ===================================================================
 _NOISE_LINE = re.compile(
     r"(?i)"
     # blank
@@ -86,12 +74,28 @@ _NOISE_LINE = re.compile(
 
     # Generic CI markers with no diagnostic value
     r"^\s*(?:Started by|Running in|Established SSH|"
-    r"\+\s*(?:echo|export|cd|mkdir|chmod|set)\s)"
+    r"\+\s*(?:echo|export|cd|mkdir|chmod|set)\s)|"
+
+    # Spring Boot banner / version line
+    r"^\s*::\s*Spring Boot ::|"
+    r"^\s*\(v\d+\.\d+\.\d+\)\s*$|"
+    # Spring Cloud config-client retry spam (after timestamp strip: "INFO 4893 --- ...")
+    r"^\s*INFO\s+\d+\s+---\s+\[[^\]]+\]\s+.*ConfigServerConfigDataLoader\s*:|"
+    r"^\s*INFO\s+\d+\s+---\s+\[[^\]]+\]\s+.*\s+Fetching config from server at\s*:|"
+    r"^\s*INFO\s+\d+\s+---\s+\[[^\]]+\]\s+.*Exception on Url\s*-|"
+    # Java stack frames / trace filler
+    r"^\s+at\s+(?:[\w.$]+\.)+[\w$]+\([^)]*\)\s*(?:~\[.*)?\s*$|"
+    r"^\s*\.{3}\s+\d+\s+more\s*$|"
+    r"^\s*Caused by:\s*$|"
+    # Maven Surefire / Mockito harness
+    r"^\[INFO\]\s+(?:Running com\.|Surefire report directory:|Using auto detected provider|T E S T S)\b|"
+    r"^\s*Mockito is currently self-attaching|"
+    r"^\s*WARNING:\s+A (?:Java agent|terminally deprecated method)|"
+    r"^\s*WARNING:\s+If a serviceability tool|"
+    r"^\s*WARNING:\s+Please consider reporting|"
+    r"^.*Spring Cloud LoadBalancer is currently working with the default cache"
 )
 
-# ===================================================================
-# Fingerprint extraction patterns
-# ===================================================================
 _EXCEPTION_CLASS = re.compile(
     r"\b([a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*"
     r"(?:Exception|Error|Failure|Fault))\b"
@@ -120,16 +124,15 @@ _KEY_SIGNAL = re.compile(
     r")\b"
 )
 
-# ===================================================================
-# Lazy singletons
-# ===================================================================
 _embedding_model: SentenceTransformer | None = None
 _es_client: Elasticsearch | None = None
 
 
-# ===================================================================
-# Public: log filtering
-# ===================================================================
+def reset_es_client() -> None:
+    """Drop cached ES client (e.g. after config URL change or in tests)."""
+    global _es_client
+    _es_client = None
+
 
 def filter_logs(raw_text: str) -> str:
     """Strip timestamps, CI boilerplate, and package-download noise."""
@@ -148,10 +151,6 @@ def filter_logs(raw_text: str) -> str:
     return "\n".join(out).strip()
 
 
-# ===================================================================
-# Public: fingerprint generation
-# ===================================================================
-
 def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
     """Build a compact, searchable fingerprint from error signals + stage name."""
     exception_types: list[str] = []
@@ -161,9 +160,11 @@ def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
     seen_exceptions: set[str] = set()
 
     for line in filtered_logs.splitlines():
+        if re.match(r"^\s+at\s+\S", line) or re.match(r"^\s*Caused by:\s*$", line):
+            continue
         for m in _EXCEPTION_CLASS.finditer(line):
             short = m.group(1).rsplit(".", 1)[-1]
-            if short not in seen_exceptions:
+            if short not in seen_exceptions and len(exception_types) < 6:
                 seen_exceptions.add(short)
                 exception_types.append(short)
 
@@ -184,7 +185,7 @@ def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
 
     parts: list[str] = [f"stage:{stage_name}"]
     if exception_types:
-        parts.append("exceptions: " + ", ".join(exception_types[:10]))
+        parts.append("exceptions: " + ", ".join(exception_types[:6]))
     if caused_by_msgs:
         parts.append("root_cause: " + caused_by_msgs[-1])
     elif error_messages:
@@ -194,10 +195,6 @@ def generate_fingerprint(filtered_logs: str, stage_name: str) -> str:
 
     return " | ".join(parts)
 
-
-# ===================================================================
-# Embedding helpers
-# ===================================================================
 
 def _get_embedding_model() -> SentenceTransformer:
     global _embedding_model
@@ -213,13 +210,10 @@ def embed_text(text: str) -> list[float]:
     return model.encode(text, normalize_embeddings=True).tolist()
 
 
-# ===================================================================
-# Elasticsearch helpers
-# ===================================================================
-
 def _get_es_client() -> Elasticsearch:
     global _es_client
     if _es_client is None:
+        logger.info("Elasticsearch client hosts=%s", settings.elasticsearch_url)
         kwargs: dict[str, Any] = {
             "hosts": [settings.elasticsearch_url],
             "request_timeout": 30,
@@ -230,10 +224,41 @@ def _get_es_client() -> Elasticsearch:
     return _es_client
 
 
+def _solution_properties() -> dict[str, Any]:
+    return {
+        "fingerprint_text": {"type": "text"},
+        "fingerprint_vector": {
+            "type": "dense_vector",
+            "dims": 384,
+            "index": True,
+            "similarity": "cosine",
+        },
+        "solution": {"type": "text"},
+        "solution_score": {"type": "float"},
+        "job_name": {"type": "keyword"},
+        "stage_name": {"type": "keyword"},
+        "build_number": {"type": "integer"},
+        "created_at": {"type": "date"},
+    }
+
+
 def ensure_index() -> None:
     """Create the ES index with dense-vector mapping if it doesn't exist."""
     es = _get_es_client()
     idx = settings.elasticsearch_index
+    if es.indices.exists(index=idx):
+        return
+    es.indices.create(
+        index=idx,
+        mappings={"properties": _solution_properties()},
+    )
+    logger.info("Created ES index: %s", idx)
+
+
+def ensure_context_index() -> None:
+    """Optional index for filtered-log snippets keyed by fingerprint (extra LLM context)."""
+    es = _get_es_client()
+    idx = settings.elasticsearch_context_index
     if es.indices.exists(index=idx):
         return
     es.indices.create(
@@ -247,19 +272,23 @@ def ensure_index() -> None:
                     "index": True,
                     "similarity": "cosine",
                 },
-                "solution": {"type": "text"},
-                "job_name": {"type": "keyword"},
-                "stage_name": {"type": "keyword"},
-                "build_number": {"type": "integer"},
+                "filtered_excerpt": {"type": "text"},
                 "created_at": {"type": "date"},
             }
         },
     )
-    logger.info("Created ES index: %s", idx)
+    logger.info("Created ES context index: %s", idx)
+
+
+def _combined_rank(hit: dict[str, Any]) -> float:
+    src = hit.get("_source") or {}
+    base = float(hit.get("_score") or 0.0)
+    q = float(src.get("solution_score", 1.0))
+    return base * q
 
 
 def search_similar_solutions(fingerprint: str) -> list[dict[str, Any]]:
-    """Embed the fingerprint and knn-search ES for past solutions above threshold."""
+    """Embed the fingerprint, knn-search ES, return up to 3 best-ranked matches."""
     es = _get_es_client()
     vector = embed_text(fingerprint)
 
@@ -269,21 +298,30 @@ def search_similar_solutions(fingerprint: str) -> list[dict[str, Any]]:
             knn={
                 "field": "fingerprint_vector",
                 "query_vector": vector,
-                "k": settings.similarity_top_k,
+                "k": 12,
                 "num_candidates": 50,
             },
-            source=["fingerprint_text", "solution", "job_name",
-                     "stage_name", "build_number"],
+            source=[
+                "fingerprint_text",
+                "solution",
+                "solution_score",
+                "job_name",
+                "stage_name",
+                "build_number",
+            ],
         )
     except Exception:
         logger.exception("ES knn search failed")
         return []
 
+    hits = resp["hits"]["hits"]
+    ranked = [h for h in hits if float(h.get("_score") or 0.0) >= settings.similarity_threshold]
+    if not ranked:
+        ranked = hits[:3]
+    ranked.sort(key=_combined_rank, reverse=True)
     results: list[dict[str, Any]] = []
-    for hit in resp["hits"]["hits"]:
-        score = hit.get("_score", 0.0)
-        if score >= settings.similarity_threshold:
-            results.append({"score": score, **hit["_source"]})
+    for hit in ranked[: settings.similarity_top_k]:
+        results.append({"score": float(hit.get("_score") or 0.0), **hit["_source"]})
     return results
 
 
@@ -293,11 +331,12 @@ def store_solution(
     job_name: str = "",
     stage_name: str = "",
     build_number: int = 0,
+    solution_score: float = 1.0,
 ) -> str:
-    """Embed and index a verified solution so future builds can find it."""
+    """Embed and index a verified solution (multiple docs per fingerprint allowed)."""
     es = _get_es_client()
     vector = embed_text(fingerprint)
-    doc_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+    doc_id = str(uuid.uuid4())
 
     es.index(
         index=settings.elasticsearch_index,
@@ -306,6 +345,7 @@ def store_solution(
             "fingerprint_text": fingerprint,
             "fingerprint_vector": vector,
             "solution": solution,
+            "solution_score": solution_score,
             "job_name": job_name,
             "stage_name": stage_name,
             "build_number": build_number,
@@ -314,3 +354,52 @@ def store_solution(
     )
     logger.info("Stored solution doc_id=%s for %s #%d", doc_id, job_name, build_number)
     return doc_id
+
+
+def store_filtered_context(fingerprint: str, filtered_excerpt: str) -> str:
+    """Store a filtered-log excerpt for retrieval keyed by fingerprint embedding."""
+    es = _get_es_client()
+    ensure_context_index()
+    vector = embed_text(fingerprint)
+    doc_id = str(uuid.uuid4())
+    es.index(
+        index=settings.elasticsearch_context_index,
+        id=doc_id,
+        document={
+            "fingerprint_text": fingerprint,
+            "fingerprint_vector": vector,
+            "filtered_excerpt": filtered_excerpt,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    logger.info("Stored context snippet doc_id=%s", doc_id)
+    return doc_id
+
+
+def prune_stale_documents() -> None:
+    """Drop documents older than retention windows (per-index ``created_at``)."""
+    es = _get_es_client()
+    for idx, days in (
+        (settings.elasticsearch_index, settings.elasticsearch_retention_solutions_days),
+        (settings.elasticsearch_context_index, settings.elasticsearch_retention_context_days),
+    ):
+        if days <= 0:
+            continue
+        try:
+            if not es.indices.exists(index=idx):
+                continue
+        except Exception:
+            logger.exception("ES exists check failed for %s", idx)
+            continue
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        cutoff_s = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        try:
+            es.delete_by_query(
+                index=idx,
+                query={"range": {"created_at": {"lt": cutoff_s}}},
+                refresh=True,
+                conflicts="proceed",
+            )
+            logger.info("Pruned documents in %s older than %s", idx, cutoff_s)
+        except Exception:
+            logger.exception("Prune failed for index %s", idx)

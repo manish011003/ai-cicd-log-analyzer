@@ -1,11 +1,32 @@
+import logging
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import psycopg
+
+logger = logging.getLogger(__name__)
+
+
+def _log_database_target(database_url: str) -> None:
+    """Log host/port/db (no password) so you can confirm it matches ``docker exec`` target."""
+    try:
+        p = urlparse(database_url)
+        db = (p.path or "/").lstrip("/") or "(unknown)"
+        logger.info(
+            "Postgres state store using host=%s port=%s database=%s — "
+            "psql in the same DB must use this database on this host/port",
+            p.hostname or "(none)",
+            p.port or 5432,
+            db,
+        )
+    except Exception:
+        logger.warning("Could not parse DATABASE_URL for logging")
 
 
 class PostgresStateStore:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
+        _log_database_target(database_url)
         self._ensure_schema()
 
     def _connect(self) -> psycopg.Connection:
@@ -39,7 +60,7 @@ class PostgresStateStore:
                     SET status = 'failed',
                         last_error = 'stale processing reclaim'
                     WHERE status = 'processing'
-                      AND first_seen_at < NOW() - (%s || ' minutes')::interval
+                      AND first_seen_at < NOW() - (%s * INTERVAL '1 minute')
                     """,
                     (stale_minutes,),
                 )
@@ -83,7 +104,14 @@ class PostgresStateStore:
                     (job_full_name, build_number),
                 )
                 row = cur.fetchone()
-                return bool(row)
+                ok = bool(row)
+                if ok:
+                    logger.info(
+                        "State DB: claimed job=%s build=%d (status -> processing)",
+                        job_full_name,
+                        build_number,
+                    )
+                return ok
 
     def mark_processed(self, job_full_name: str, build_number: int) -> None:
         with self._connect() as conn:
@@ -98,6 +126,11 @@ class PostgresStateStore:
                     WHERE job_full_name = %s AND build_number = %s
                     """,
                     (datetime.now(UTC), job_full_name, build_number),
+                )
+                logger.info(
+                    "State DB: marked processed job=%s build=%d",
+                    job_full_name,
+                    build_number,
                 )
 
     def mark_failed(self, job_full_name: str, build_number: int, error: str) -> None:
@@ -122,7 +155,7 @@ class PostgresStateStore:
                     DELETE FROM jenkins_failure_events
                     WHERE status = 'processed'
                       AND processed_at IS NOT NULL
-                      AND processed_at < NOW() - (%s || ' days')::interval
+                      AND processed_at < NOW() - (%s * INTERVAL '1 day')
                     """,
                     (days,),
                 )

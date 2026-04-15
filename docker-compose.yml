@@ -1,0 +1,105 @@
+# Stack for analyzer_project: Postgres (listener state), Elasticsearch + Kibana (worker),
+# optional Jenkins (custom image — enable with profile), optional web UI (Node in Docker).
+#
+# Usage:
+#   docker compose up -d
+#   docker compose --profile jenkins up -d    # include Jenkins if you use image my-jenkins:2.541.1
+#   docker compose --profile ui up -d         # Vite dev server (npm in container, http://localhost:5173)
+#
+# Stop old one-off containers that bind the same ports (9200, 5601, 5432) before starting.
+#
+# Host apps (listener/worker on Windows/Mac):
+#   DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/jenkins_listener
+#   ELASTICSEARCH_URL=http://127.0.0.1:9200
+#
+# Apps running inside this Compose network can use service hostnames:
+#   postgresql://postgres:postgres@postgres:5432/jenkins_listener
+#   http://elasticsearch:9200
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jenkins-listener-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: jenkins_listener
+    volumes:
+      - jenkins_listener_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jenkins_listener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - analyzer
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: elastic-test
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - analyzer
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - analyzer
+
+  # Optional: only if you build/tag this image locally (matches common setup).
+  # Otherwise run Jenkins separately and keep JENKINS_BASE_URL=http://localhost:8080
+  jenkins:
+    profiles: ["jenkins"]
+    image: my-jenkins:2.541.1
+    container_name: jenkins
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+    networks:
+      - analyzer
+
+  # Node + npm + Vite without installing Node on the host. Run web backend on host:8095 first.
+  web-frontend:
+    profiles: ["ui"]
+    image: node:22-bookworm-slim
+    container_name: analyzer-web-ui
+    working_dir: /app
+    volumes:
+      - ./web/frontend:/app
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_PROXY_TARGET: http://host.docker.internal:8095
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    networks:
+      - analyzer
+
+volumes:
+  jenkins_listener_pgdata:
+  elasticsearch_data:
+  jenkins_home:
+
+networks:
+  analyzer:
+    driver: bridge

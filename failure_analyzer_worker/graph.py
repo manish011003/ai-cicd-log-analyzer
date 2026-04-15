@@ -1,14 +1,4 @@
-"""LangGraph workflow for failure analysis.
-
-Nodes
-─────
-preprocess          → filter logs, build fingerprint, search ES
-analyze_with_context→ LLM receives filtered logs + retrieved past solution
-analyze_fresh       → LLM receives only filtered logs (no prior match)
-
-The routing edge after *preprocess* picks the right analysis node based on
-whether Elasticsearch returned any solutions above the similarity threshold.
-"""
+"""LangGraph: preprocess (filter + fingerprint + ES knn) → analyze with/without prior match."""
 
 from __future__ import annotations
 
@@ -17,7 +7,7 @@ import re
 from typing import Any, TypedDict
 
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
@@ -26,10 +16,6 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-
-# ===================================================================
-# State flowing through the graph
-# ===================================================================
 
 class AnalysisState(TypedDict, total=False):
     # --- inputs (set by the caller) ---
@@ -49,10 +35,6 @@ class AnalysisState(TypedDict, total=False):
     matched_solution: str
     match_score: float
 
-
-# ===================================================================
-# Prompts
-# ===================================================================
 
 _SYSTEM_PROMPT = (
     "You are a senior CI/CD failure analyst. You help developers understand "
@@ -109,10 +91,6 @@ in code blocks. Each step should be clear enough to follow without guessing.
 Keep the total response under 400 words."""
 
 
-# ===================================================================
-# Node implementations
-# ===================================================================
-
 def preprocess(state: AnalysisState) -> dict:
     """Filter logs → fingerprint → ES similarity search."""
     filtered = log_processor.filter_logs(state["raw_logs"])
@@ -144,12 +122,7 @@ def _route(state: AnalysisState) -> str:
 
 
 def _split_response(content: str) -> tuple[str, str]:
-    """Split LLM response into (analysis, suggested_fix).
-
-    Looks for the first '## Step-by-Step Fix' or '## Step-by-step Fix' heading
-    and splits there. Everything before is analysis, everything from that
-    heading onward is the suggested fix.
-    """
+    """Split on the first ``## Step-by-Step Fix`` heading into (analysis, suggested_fix)."""
     pattern = re.compile(
         r"(?m)^#{1,6}\s*Step-by-Step\s+Fix",
         re.IGNORECASE,
@@ -198,6 +171,52 @@ def analyze_with_context(state: AnalysisState) -> dict:
     }
 
 
+CLARIFY_SYSTEM = (
+    "You help refine CI/CD failure analysis. The user may reject or question the suggested fix. "
+    "Ask concise follow-up questions or propose a revised fix. Keep under 350 words."
+)
+
+
+def chat_clarification_reply(
+    messages: list[dict[str, str]],
+    *,
+    fingerprint: str = "",
+    log_excerpt: str = "",
+    job_name: str = "",
+    stage_name: str = "",
+    build_number: int = 0,
+    analysis: str = "",
+    suggested_fix: str = "",
+) -> str:
+    """Follow-up chat after initial analysis (e.g. user rejected the suggested fix)."""
+    ctx_parts: list[str] = []
+    if job_name or build_number:
+        ctx_parts.append(f"Job: {job_name} #{build_number}  stage: {stage_name}")
+    if analysis:
+        ctx_parts.append(f"## Original Analysis\n{analysis}")
+    if suggested_fix:
+        ctx_parts.append(f"## Suggested Fix\n{suggested_fix}")
+    if fingerprint:
+        ctx_parts.append(f"Fingerprint:\n{fingerprint}")
+    if log_excerpt and log_excerpt.strip():
+        ctx_parts.append(f"Filtered log excerpt:\n{log_excerpt[:12000]}")
+    ctx = "\n\n".join(ctx_parts)
+    sys_content = CLARIFY_SYSTEM + ("\n\n" + ctx if ctx else "")
+    lc_messages: list = [SystemMessage(content=sys_content)]
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "assistant":
+            lc_messages.append(AIMessage(content=content))
+        else:
+            lc_messages.append(HumanMessage(content=content))
+
+    logger.info("chat_clarification_reply  msgs=%d  ctx_len=%d", len(messages), len(sys_content))
+    resp = _get_llm().invoke(lc_messages)
+    out = resp.content
+    return out if isinstance(out, str) else str(out)
+
+
 def analyze_fresh(state: AnalysisState) -> dict:
     """No prior match — ask the LLM to diagnose from scratch."""
     prompt = _FRESH_TEMPLATE.format(
@@ -220,10 +239,6 @@ def analyze_fresh(state: AnalysisState) -> dict:
         "recommendation": "fresh_analysis",
     }
 
-
-# ===================================================================
-# Graph assembly
-# ===================================================================
 
 def build_graph():
     builder = StateGraph(AnalysisState)

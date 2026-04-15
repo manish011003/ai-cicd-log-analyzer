@@ -13,6 +13,30 @@ from app.models import FailedStage, FailureEvent
 
 logger = logging.getLogger(__name__)
 
+
+def _xml_local_name(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _rss_child_text(parent: ET.Element, local: str) -> str:
+    for child in parent:
+        if _xml_local_name(child.tag) == local:
+            return (child.text or "").strip()
+    return ""
+
+
+def _rss_item_link(item: ET.Element) -> str:
+    for child in item:
+        if _xml_local_name(child.tag) != "link":
+            continue
+        if (child.text or "").strip():
+            return (child.text or "").strip()
+        href = child.get("href")
+        if href:
+            return href.strip()
+    return ""
+
+
 _HTML_TAG = re.compile(r"<[^>]+>")
 _JENKINS_TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}\s+", re.MULTILINE)
 
@@ -117,7 +141,17 @@ _LOG_NOISE_LINE = re.compile(
     # Bare timestamp-only or marker-only lines
     r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?(?:Started by|Running in|"
     r"Checking out Revision|using credential|"
-    r"\> git\s|Cloning repository)\b"
+    r"\> git\s|Cloning repository)\b|"
+    # Spring Boot / Spring Cloud INFO noise (config client retries, banners)
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*ConfigServerConfigDataLoader\s*:|"
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*Fetching config from server at\s*:|"
+    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*Exception on Url\s*-|"
+    r"^\s*::\s*Spring Boot ::|"
+    r"^\s*\(v\d+\.\d+\.\d+\)\s*$|"
+    # Maven Surefire / test harness chatter
+    r"^\[INFO\]\s+(?:Running com\.|Surefire report directory:|Using auto detected provider|T E S T S)\b|"
+    r"^\s*Mockito is currently self-attaching|"
+    r"^\s*WARNING:\s+A (?:Java agent|terminally deprecated method)"
 )
 
 
@@ -206,11 +240,7 @@ class JenkinsClient:
         return "/".join([f"job/{quote(part, safe='')}" for part in job_full_name.split("/")])
 
     def list_failed_builds_from_rss(self) -> list[dict]:
-        """Parse the Jenkins failed-builds RSS/Atom feed. No time filtering.
-
-        The RSS feed is naturally bounded by Jenkins (last ~20 entries).
-        Callers should filter by build_number using Postgres state.
-        """
+        """Parse the Jenkins failed-builds RSS/Atom feed. No time filtering."""
         url = f"{self.base_url}{self.failed_rss_path}"
         response = self.client.get(url)
         response.raise_for_status()
@@ -229,21 +259,32 @@ class JenkinsClient:
                 parsed = self._parse_title_and_link(title, link)
                 if parsed:
                     items.append(parsed)
+                else:
+                    logger.debug("RSS atom: could not parse title: %s", title[:200])
         else:
-            for item in root.findall("./channel/item"):
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
+            rss_items = root.findall(".//{*}item")
+            if not rss_items:
+                rss_items = root.findall("./channel/item")
+            for item in rss_items:
+                title = _rss_child_text(item, "title")
+                link = _rss_item_link(item)
                 if not title or not link:
                     continue
                 parsed = self._parse_title_and_link(title, link)
                 if parsed:
                     items.append(parsed)
+                else:
+                    logger.debug("RSS item: could not parse title: %s", title[:200])
+
         return items
 
     @staticmethod
     def _parse_title_and_link(title: str, link: str) -> dict | None:
-        # Example title: "my-folder » my-job #123 (Failed)"
+        # Typical: "my-folder » my-job #123 (Failed)"  (Jenkins classic)
         match = re.search(r"(?P<job>.+)\s+#(?P<num>\d+)\s+\(", title)
+        if not match:
+            # Some Jenkins themes omit the trailing "(Failed)" clause
+            match = re.search(r"(?P<job>.+)\s+#(?P<num>\d+)\s*$", title.strip())
         if not match:
             return None
 
@@ -264,40 +305,86 @@ class JenkinsClient:
         return response.json()
 
     def failed_stages(self, job_full_name: str, build_number: int) -> list[FailedStage]:
+        """Resolve failed Pipeline stages via wfapi; fall back to full console if unavailable.
+
+        ``wfapi/describe`` exists only for **Pipeline** (workflow) builds. Freestyle / Maven /
+        other job types return **404**, which previously produced empty ``failed_stages`` even
+        though the build failed. In that case we attach a single synthetic stage **Build**
+        whose excerpt is derived from ``consoleText``.
+        """
         job_path = self._job_path(job_full_name)
         url = f"{self.base_url}/{job_path}/{build_number}/wfapi/describe"
         response = self.client.get(url)
-        if response.status_code >= 400:
-            return []
 
-        data = response.json()
-        stages = data.get("stages", [])
+        stages: list[dict] = []
+        if response.status_code < 400:
+            try:
+                data = response.json()
+                stages = data.get("stages", []) or []
+            except Exception:
+                logger.warning("%s#%s: wfapi/describe body is not JSON", job_full_name, build_number)
+                stages = []
+        else:
+            logger.info(
+                "%s#%s: wfapi/describe HTTP %s (not a Pipeline build or wfapi disabled); "
+                "using consoleText fallback",
+                job_full_name,
+                build_number,
+                response.status_code,
+            )
 
         root_failures = self._select_root_failure_stages(stages)
-        if not root_failures:
+        if root_failures:
+            failed: list[FailedStage] = []
+            console_text: str | None = None
+
+            for stage in root_failures:
+                stage_status = str(stage.get("status", "")).upper()
+                stage_id = str(stage.get("id")) if stage.get("id") is not None else None
+                stage_name = str(stage.get("name", "unknown-stage"))
+                excerpt = self._stage_log_excerpt(job_full_name, build_number, stage_id, stage_name)
+                if not excerpt:
+                    if console_text is None:
+                        console_text = self._build_console_text(job_full_name, build_number)
+                    excerpt = self._extract_stage_excerpt_from_console(console_text, stage_name)
+                if not excerpt.strip():
+                    if console_text is None:
+                        console_text = self._build_console_text(job_full_name, build_number)
+                    excerpt = self._full_console_excerpt(console_text)
+                failed.append(
+                    FailedStage(
+                        stage_name=stage_name,
+                        stage_id=stage_id,
+                        status=stage_status,
+                        log_excerpt=excerpt,
+                    )
+                )
+            return failed
+
+        # No wfapi failures (freestyle, non-stage pipeline, or only successful stages in describe).
+        if stages:
+            logger.info(
+                "%s#%s: wfapi has %d stage row(s) but none FAILED/ERROR/ABORTED; consoleText fallback",
+                job_full_name,
+                build_number,
+                len(stages),
+            )
+
+        console_text = self._build_console_text(job_full_name, build_number)
+        if not console_text.strip():
+            logger.info("%s#%s: consoleText empty; leaving failed_stages empty", job_full_name, build_number)
             return []
 
-        failed: list[FailedStage] = []
-        console_text: str | None = None
+        excerpt = self._full_console_excerpt(console_text)
 
-        for stage in root_failures:
-            stage_status = str(stage.get("status", "")).upper()
-            stage_id = str(stage.get("id")) if stage.get("id") is not None else None
-            stage_name = str(stage.get("name", "unknown-stage"))
-            excerpt = self._stage_log_excerpt(job_full_name, build_number, stage_id, stage_name)
-            if not excerpt:
-                if console_text is None:
-                    console_text = self._build_console_text(job_full_name, build_number)
-                excerpt = self._extract_stage_excerpt_from_console(console_text, stage_name)
-            failed.append(
-                FailedStage(
-                    stage_name=stage_name,
-                    stage_id=stage_id,
-                    status=stage_status,
-                    log_excerpt=excerpt,
-                )
+        return [
+            FailedStage(
+                stage_name="Build",
+                stage_id=None,
+                status="FAILURE",
+                log_excerpt=excerpt,
             )
-        return failed
+        ]
 
     def _select_root_failure_stages(self, stages: list[dict]) -> list[dict]:
         """Return the earliest failed stage and any parallel siblings that failed
@@ -401,6 +488,23 @@ class JenkinsClient:
             return ""
         return response.text or ""
 
+    def _full_console_excerpt(self, console_text: str) -> str:
+        """Derive an error-oriented excerpt from full console output.
+
+        Used for freestyle / non-workflow jobs (no wfapi stage logs) and whenever
+        Pipeline stage-specific excerpts are empty.
+        """
+        if not (console_text or "").strip():
+            return ""
+        raw = console_text.strip()
+        excerpt = self._stage_error_snippets(raw).strip()
+        if excerpt:
+            return excerpt
+        excerpt = self._first_cause_excerpt(raw).strip()
+        if excerpt:
+            return excerpt
+        return _truncate_log_chars(raw, self.max_stage_log_chars)
+
     def _extract_stage_excerpt_from_console(self, console_text: str, stage_name: str) -> str:
         """Extract error snippets from consoleText, narrowing to the stage section when possible.
 
@@ -478,13 +582,13 @@ class JenkinsClient:
                 windows.append((wlo, whi))
 
         parts: list[str] = []
-        for rank, (wlo, whi) in enumerate(windows, start=1):
+        for _rank, (wlo, whi) in enumerate(windows, start=1):
             chunk = bounded[wlo:whi]
             cleaned = [ln for ln in chunk if ln.strip() and not _LOG_NOISE_LINE.match(ln)]
             if not cleaned:
                 continue
             body = "\n".join(cleaned)
-            parts.append(f"--- error region {rank} (lines {wlo + 1}-{whi} of {n}) ---\n{body}")
+            parts.append(body)
 
         out = "\n\n".join(parts).strip()
         if not out:
