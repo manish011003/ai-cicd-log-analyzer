@@ -22,6 +22,7 @@ Desktop.ini
 
 # Node
 node_modules/
+.next/
 
 # Distribution / packaging
 *.egg-info/

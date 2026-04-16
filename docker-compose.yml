@@ -1,27 +1,34 @@
-# Stack for analyzer_project: Postgres (listener state), Elasticsearch + Kibana (worker),
-# optional Jenkins (custom image — enable with profile), optional web UI (Node in Docker).
+# Full stack: Postgres, Elasticsearch, Kibana, worker, Jenkins listener API, web API, Next.js UI.
 #
-# Usage:
-#   docker compose up -d
-#   docker compose --profile jenkins up -d    # include Jenkins if you use image my-jenkins:2.541.1
-#   docker compose --profile ui up -d         # Next.js dev server (npm in container, http://localhost:5173)
+# Setup:
+#   cp docker-compose.env.example .env
+#   Edit .env (GROQ_API_KEY, Jenkins credentials, WORKER_API_KEY).
 #
-# Stop old one-off containers that bind the same ports (9200, 5601, 5432) before starting.
+# Run:
+#   docker compose up -d --build
 #
-# Host apps (listener/worker on Windows/Mac):
-#   DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/jenkins_listener
-#   ELASTICSEARCH_URL=http://127.0.0.1:9200
+# URLs (defaults):
+#   Web UI:     http://localhost:3000
+#   Web API:    http://localhost:8095
+#   Worker:     http://localhost:8090
+#   Listener:   http://localhost:8088
+#   Kibana:     http://localhost:5601
 #
-# Apps running inside this Compose network can use service hostnames:
-#   postgresql://postgres:postgres@postgres:5432/jenkins_listener
-#   http://elasticsearch:9200
+# Continuous Jenkins polling (same image as listener, no HTTP):
+#   docker compose --profile poll up -d
+#
+# Optional Jenkins in Compose (custom image):
+#   docker compose --profile jenkins up -d
+#
+# Next.js dev server in Docker (bind-mount, port 5173):
+#   docker compose --profile dev-ui up -d
 
 services:
   postgres:
     image: postgres:16-alpine
     container_name: jenkins-listener-postgres
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PUBLISH_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -44,9 +51,15 @@ services:
       - xpack.security.enabled=false
       - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "9200:9200"
+      - "${ELASTICSEARCH_PUBLISH_PORT:-9200}:9200"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
     networks:
       - analyzer
 
@@ -54,16 +67,135 @@ services:
     image: docker.elastic.co/kibana/kibana:8.12.0
     container_name: kibana
     ports:
-      - "5601:5601"
+      - "${KIBANA_PUBLISH_PORT:-5601}:5601"
     environment:
       ELASTICSEARCH_HOSTS: http://elasticsearch:9200
     depends_on:
-      - elasticsearch
+      elasticsearch:
+        condition: service_healthy
     networks:
       - analyzer
 
-  # Optional: only if you build/tag this image locally (matches common setup).
-  # Otherwise run Jenkins separately and keep JENKINS_BASE_URL=http://localhost:8080
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: analyzer-worker
+    environment:
+      WORKER_HOST: 0.0.0.0
+      WORKER_PORT: "8090"
+      WORKER_API_KEY: ${WORKER_API_KEY:-replace-me}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX:-failure_solutions}
+      ELASTICSEARCH_CONTEXT_INDEX: ${ELASTICSEARCH_CONTEXT_INDEX:-failure_context}
+      ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      WEB_UI_API_URL: http://web-backend:8095
+      WEB_UI_PUBLIC_URL: ${WEB_UI_PUBLIC_URL:-http://localhost:3000}
+    ports:
+      - "${WORKER_PUBLISH_PORT:-8090}:8090"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - analyzer
+
+  listener:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.listener
+    container_name: analyzer-listener
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jenkins_listener
+      JENKINS_BASE_URL: ${JENKINS_BASE_URL:-http://host.docker.internal:8080}
+      JENKINS_USER: ${JENKINS_USER:-changeme}
+      JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-changeme}
+      JENKINS_FAILED_RSS_PATH: ${JENKINS_FAILED_RSS_PATH:-/rssFailed}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-20}
+      STATE_RETENTION_DAYS: ${STATE_RETENTION_DAYS:-30}
+      WORKER_INGEST_URL: http://worker:8090/ingest/failure
+      WORKER_INGEST_API_KEY: ${WORKER_API_KEY:-replace-me}
+      WORKER_SEND_BATCH: ${WORKER_SEND_BATCH:-true}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-300}
+    ports:
+      - "${LISTENER_PUBLISH_PORT:-8088}:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    networks:
+      - analyzer
+
+  listener-poller:
+    profiles: ["poll"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.listener
+    container_name: analyzer-listener-poller
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jenkins_listener
+      JENKINS_BASE_URL: ${JENKINS_BASE_URL:-http://host.docker.internal:8080}
+      JENKINS_USER: ${JENKINS_USER:-changeme}
+      JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-changeme}
+      JENKINS_FAILED_RSS_PATH: ${JENKINS_FAILED_RSS_PATH:-/rssFailed}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-20}
+      STATE_RETENTION_DAYS: ${STATE_RETENTION_DAYS:-30}
+      WORKER_INGEST_URL: http://worker:8090/ingest/failure
+      WORKER_INGEST_API_KEY: ${WORKER_API_KEY:-replace-me}
+      WORKER_SEND_BATCH: ${WORKER_SEND_BATCH:-true}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-300}
+    command: ["python", "run_listener.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    networks:
+      - analyzer
+
+  web-backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web-backend
+    container_name: analyzer-web-backend
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jenkins_listener
+      WORKER_BASE_URL: http://worker:8090
+      WORKER_API_KEY: ${WORKER_API_KEY:-replace-me}
+      LISTENER_BASE_URL: http://listener:8088
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "${WEB_BACKEND_PUBLISH_PORT:-8095}:8095"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    networks:
+      - analyzer
+
+  web-frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web-frontend
+      args:
+        NEXT_PUBLIC_API_TARGET: http://web-backend:8095
+    container_name: analyzer-web-frontend
+    ports:
+      - "${WEB_FRONTEND_PUBLISH_PORT:-3000}:3000"
+    depends_on:
+      web-backend:
+        condition: service_started
+    networks:
+      - analyzer
+
   jenkins:
     profiles: ["jenkins"]
     image: my-jenkins:2.541.1
@@ -76,11 +208,10 @@ services:
     networks:
       - analyzer
 
-  # Node + npm + Next.js without installing Node on the host. Run web backend on host:8095 first.
-  web-frontend:
-    profiles: ["ui"]
-    image: node:22-bookworm-slim
-    container_name: analyzer-web-ui
+  web-frontend-dev:
+    profiles: ["dev-ui"]
+    image: node:22-slim
+    container_name: analyzer-web-ui-dev
     working_dir: /app
     volumes:
       - ./web/frontend:/app

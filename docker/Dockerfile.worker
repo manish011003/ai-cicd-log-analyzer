@@ -1,0 +1,21 @@
+# Build from repository root: docker build -f docker/Dockerfile.worker .
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+COPY failure_analyzer_worker/requirements.txt /app/failure_analyzer_worker/requirements.txt
+RUN pip install --no-cache-dir -r /app/failure_analyzer_worker/requirements.txt
+
+COPY failure_analyzer_worker/ /app/failure_analyzer_worker/
+
+ENV WORKER_HOST=0.0.0.0
+EXPOSE 8090
+
+CMD ["python", "-m", "failure_analyzer_worker"]
