@@ -64,9 +64,11 @@ By default (`WORKER_SEND_BATCH=true`) the listener sends **one HTTP request per 
 
 - Continuous listener:
   - `python run_listener.py`
-- API mode (optional):
-  - `uvicorn app.main:app --reload --port 8088`
-  - `POST /poll-once` for manual trigger
+  - This loop **does not** expose HTTP; the web dashboard cannot call `POST /poll-once` while only this process is running.
+- API mode (required for **Refresh / Auto-poll** in the Next.js UI):
+  - `uvicorn app.main:app --reload --host 127.0.0.1 --port 8088`
+  - `POST /poll-once` for manual trigger (proxied by the web backend from `/api/listener/poll-once`).
+  - Set `LISTENER_BASE_URL` on the **web backend** to the same host/port (default in code: `http://127.0.0.1:8088`).
 
 ## Operational notes
 

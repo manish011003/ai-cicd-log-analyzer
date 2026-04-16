@@ -4,7 +4,7 @@
 # Usage:
 #   docker compose up -d
 #   docker compose --profile jenkins up -d    # include Jenkins if you use image my-jenkins:2.541.1
-#   docker compose --profile ui up -d         # Vite dev server (npm in container, http://localhost:5173)
+#   docker compose --profile ui up -d         # Next.js dev server (npm in container, http://localhost:5173)
 #
 # Stop old one-off containers that bind the same ports (9200, 5601, 5432) before starting.
 #
@@ -76,7 +76,7 @@ services:
     networks:
       - analyzer
 
-  # Node + npm + Vite without installing Node on the host. Run web backend on host:8095 first.
+  # Node + npm + Next.js without installing Node on the host. Run web backend on host:8095 first.
   web-frontend:
     profiles: ["ui"]
     image: node:22-bookworm-slim
@@ -87,11 +87,11 @@ services:
     ports:
       - "5173:5173"
     environment:
-      VITE_API_PROXY_TARGET: http://host.docker.internal:8095
+      NEXT_PUBLIC_API_TARGET: http://host.docker.internal:8095
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: >
-      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+      sh -c "npm install && npm run dev -- --hostname 0.0.0.0 --port 5173"
     networks:
       - analyzer
 

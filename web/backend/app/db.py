@@ -169,3 +169,51 @@ def set_feedback_status(session_id: str, status: str) -> None:
                 """,
                 (status, session_id),
             )
+
+
+def list_session_records(
+    limit: int = 50,
+    job: str | None = None,
+) -> list[dict[str, Any]]:
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if job:
+                cur.execute(
+                    """
+                    SELECT id, job_full_name, build_number, stage_name, fingerprint,
+                           filtered_logs, analysis, suggested_fix, recommendation,
+                           feedback_status, created_at
+                    FROM analysis_sessions
+                    WHERE job_full_name ILIKE %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (f"%{job}%", limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, job_full_name, build_number, stage_name, fingerprint,
+                           filtered_logs, analysis, suggested_fix, recommendation,
+                           feedback_status, created_at
+                    FROM analysis_sessions
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            return list(cur.fetchall())
+
+
+def list_feedback_totals() -> list[dict[str, Any]]:
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(NULLIF(feedback_status, ''), 'new') AS status,
+                       COUNT(*) AS count
+                FROM analysis_sessions
+                GROUP BY COALESCE(NULLIF(feedback_status, ''), 'new')
+                """
+            )
+            return list(cur.fetchall())

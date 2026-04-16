@@ -93,10 +93,10 @@ Keep the total response under 400 words."""
 
 def preprocess(state: AnalysisState) -> dict:
     """Filter logs → fingerprint → ES similarity search."""
-    filtered = log_processor.filter_logs(state["raw_logs"])
-    fingerprint = log_processor.generate_fingerprint(
-        filtered, state["stage_name"]
-    )
+    raw = state["raw_logs"]
+    body = log_processor.filter_logs(raw)
+    filtered = log_processor.LogProcessor().format_with_metadata(raw, body)
+    fingerprint = log_processor.generate_fingerprint(body, state["stage_name"])
     es_matches = log_processor.search_similar_solutions(fingerprint)
 
     logger.info(

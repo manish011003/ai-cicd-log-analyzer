@@ -107,7 +107,7 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
     base = (settings.web_ui_api_url or "").strip().rstrip("/")
     if not base or not rows:
         return
-    pub = (settings.web_ui_public_url or "").strip().rstrip("/") or "http://127.0.0.1:5173"
+    pub = (settings.web_ui_public_url or "").strip().rstrip("/") or "http://127.0.0.1:3000"
     post_url = f"{base}/api/sessions"
     with httpx.Client(timeout=20.0) as client:
         for row in rows:
