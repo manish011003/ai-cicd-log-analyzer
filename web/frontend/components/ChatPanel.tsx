@@ -55,16 +55,16 @@ export default function ChatPanel({ open, activeRunId, onClose }: Props) {
   if (!open) return null;
 
   return (
-    <div className="flex h-full flex-col border-l border-zinc-800 bg-zinc-950">
-      <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+    <div className="flex h-full flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
+      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
         <div>
-          <h2 className="text-sm font-semibold text-zinc-100">CI Assistant</h2>
-          <p className="text-[10px] text-zinc-500">{activeRunId ? `Context: ${activeRunId}` : "General mode"}</p>
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">CI Assistant</h2>
+          <p className="text-[10px] text-slate-500 dark:text-slate-400">{activeRunId ? `Context: ${activeRunId}` : "General mode"}</p>
         </div>
         <button
           type="button"
           onClick={onClose}
-          className="rounded-md p-1 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+          className="rounded-md p-1 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
         >
           x
         </button>
@@ -77,7 +77,7 @@ export default function ChatPanel({ open, activeRunId, onClose }: Props) {
               className={`max-w-[90%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
                 msg.role === "user"
                   ? "rounded-br-md bg-indigo-600 text-white"
-                  : "rounded-bl-md border border-zinc-800 bg-zinc-900 text-zinc-200"
+                  : "rounded-bl-md border border-slate-200 bg-slate-50 text-slate-800 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
               }`}
             >
               <pre className="whitespace-pre-wrap break-words font-sans">{msg.content}</pre>
@@ -87,7 +87,7 @@ export default function ChatPanel({ open, activeRunId, onClose }: Props) {
 
         {sending && (
           <div className="flex justify-start">
-            <div className="rounded-2xl rounded-bl-md border border-zinc-800 bg-zinc-900 px-4 py-3 text-xs text-zinc-400">
+            <div className="rounded-2xl rounded-bl-md border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
               Thinking...
             </div>
           </div>
@@ -95,7 +95,7 @@ export default function ChatPanel({ open, activeRunId, onClose }: Props) {
         <div ref={bottomRef} />
       </div>
 
-      <div className="border-t border-zinc-800 p-3">
+      <div className="border-t border-slate-200 p-3 dark:border-slate-800">
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -110,7 +110,7 @@ export default function ChatPanel({ open, activeRunId, onClose }: Props) {
             onChange={(e) => setInput(e.target.value)}
             placeholder="Ask about a failure..."
             disabled={sending}
-            className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none transition-colors focus:border-indigo-500 disabled:opacity-50"
+            className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-900 placeholder-slate-500 outline-none transition-colors focus:border-indigo-500 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder-slate-500"
           />
           <button
             type="submit"

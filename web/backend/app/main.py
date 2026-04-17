@@ -355,6 +355,18 @@ def trigger_listener_poll() -> dict[str, Any]:
             timeout=60.0,
         )
         r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.exception("listener poll proxy failed")
+        detail: Any
+        try:
+            raw = exc.response.json()
+            if isinstance(raw, dict) and "detail" in raw:
+                detail = raw["detail"]
+            else:
+                detail = raw
+        except Exception:
+            detail = (exc.response.text or "").strip() or str(exc)
+        raise HTTPException(status_code=502, detail=detail) from exc
     except httpx.HTTPError as exc:
         logger.exception("listener poll proxy failed")
         raise HTTPException(status_code=502, detail=str(exc)) from exc

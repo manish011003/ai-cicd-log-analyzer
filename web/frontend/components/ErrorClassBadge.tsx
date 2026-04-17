@@ -8,17 +8,17 @@ interface Props {
 function tone(errorClass: string): string {
   const k = errorClass.toLowerCase();
   if (k.includes("timeout") || k.includes("connection")) {
-    return "border-amber-700/50 bg-amber-950/40 text-amber-300";
+    return "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/40 dark:text-amber-300";
   }
   if (k.includes("assert") || k.includes("test")) {
-    return "border-purple-700/50 bg-purple-950/40 text-purple-300";
+    return "border-purple-300 bg-purple-50 text-purple-800 dark:border-purple-700/50 dark:bg-purple-950/40 dark:text-purple-300";
   }
-  return "border-red-700/50 bg-red-950/40 text-red-300";
+  return "border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-700/50 dark:bg-rose-950/40 dark:text-rose-300";
 }
 
 export default function ErrorClassBadge({ errorClass, count, active, onClick }: Props) {
   const base = tone(errorClass);
-  const cls = active ? "ring-1 ring-offset-0 ring-zinc-100/30" : "";
+  const cls = active ? "ring-1 ring-slate-400/50 dark:ring-zinc-100/30" : "";
 
   if (onClick) {
     return (

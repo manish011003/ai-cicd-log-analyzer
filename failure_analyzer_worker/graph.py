@@ -40,12 +40,14 @@ _SYSTEM_PROMPT = (
     "You are a senior CI/CD failure analyst. You help developers understand "
     "and resolve Jenkins build failures. Give concise, actionable answers "
     "with step-by-step fix instructions. Include exact commands and file "
-    "changes. Keep the total response under 400 words. Use markdown headings."
+    "changes. Keep the total response under 400 words. Use markdown headings. "
+    "Never mention retrieval, similarity scores, or whether a past incident "
+    "\"matched\" the current failure—only describe the failure and the fix."
 )
 
 _WITH_CONTEXT_TEMPLATE = """\
-A Jenkins build has failed. Below are the filtered error logs and a similar \
-past error with its known resolution.
+A Jenkins build has failed. Below are the filtered error logs and a \
+reference resolution from a prior incident that may apply.
 
 **Job:** {job_name} #{build_number}
 **Stage:** {stage_name}
@@ -55,14 +57,17 @@ past error with its known resolution.
 {filtered_logs}
 ```
 
-## Similar Past Error & Resolution (similarity {match_score:.0%})
+## Reference: prior incident and verified fix
 **Past fingerprint:** {past_fingerprint}
 **Resolution:**
 {past_solution}
 
 Instructions:
-1. **Analysis** – a short paragraph explaining what went wrong, why it happened, \
-and whether the past resolution applies (note any adjustments needed).
+1. **Analysis** – explain what failed and why using the logs alone. You may use \
+the reference fix as grounding, but **do not** mention similarity scores, \
+"exact match", "partial match", retrieval, embeddings, or that the answer came \
+from a database or prior ticket. **Do not** state whether a match was found. \
+Start directly with the substantive diagnosis (symptoms, root cause, context).
 2. **Step-by-Step Fix** – numbered steps with exact commands or file changes \
 in code blocks. Each step should be clear enough to follow without guessing.
 3. **Verify** – one command or check to confirm the fix worked.
@@ -133,6 +138,49 @@ def _split_response(content: str) -> tuple[str, str]:
     return content.strip(), ""
 
 
+def _strip_match_status_preamble(text: str) -> str:
+    """Remove LLM boilerplate that announces ES/retrieval match status (not user-facing)."""
+    t = (text or "").strip()
+    if not t:
+        return t
+
+    # Peel off leading paragraph(s) that only describe match mechanics / scores.
+    for _ in range(6):
+        if "\n\n" in t:
+            para, rest = t.split("\n\n", 1)
+        else:
+            para, rest = t, ""
+
+        candidate = para.strip()
+        if not candidate:
+            t = rest.strip()
+            continue
+
+        cl = candidate.lower()
+        has_similarity_pct = bool(re.search(r"similarity\s*\d+\s*%", cl))
+        is_noise = (
+            ("exact match" in cl and ("similarity" in cl or "%" in candidate))
+            or "returning previously accepted" in cl
+            or (
+                has_similarity_pct
+                and ("match" in cl or "returning" in cl or "accepted" in cl)
+            )
+            or bool(
+                re.match(
+                    r"(?is)^(?:#+\s*)?(?:\*\*)?\s*exact\s+match\s+found\b",
+                    candidate,
+                )
+            )
+        )
+
+        if is_noise:
+            t = rest.strip()
+            continue
+        break
+
+    return t.strip()
+
+
 def _get_llm() -> ChatGroq:
     http_client = httpx.Client(verify=False)
     return ChatGroq(
@@ -152,7 +200,6 @@ def analyze_with_context(state: AnalysisState) -> dict:
         build_number=state.get("build_number", 0),
         stage_name=state.get("stage_name", "unknown"),
         filtered_logs=state.get("filtered_logs", ""),
-        match_score=best.get("score", 0),
         past_fingerprint=best.get("fingerprint_text", ""),
         past_solution=best.get("solution", ""),
     )
@@ -162,6 +209,12 @@ def analyze_with_context(state: AnalysisState) -> dict:
         HumanMessage(content=prompt),
     ])
     analysis, suggested_fix = _split_response(resp.content)
+    analysis = _strip_match_status_preamble(analysis)
+    if not analysis.strip():
+        analysis = (
+            "The build failed in this stage; the logs point to the issue described "
+            "in the step-by-step fix below."
+        )
     return {
         "analysis": analysis,
         "suggested_fix": suggested_fix,
