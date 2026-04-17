@@ -114,9 +114,22 @@ def preprocess(state: AnalysisState) -> dict:
     }
 
 
+_EXACT_MATCH_THRESHOLD = 0.98
+
+
 def _route(state: AnalysisState) -> str:
     """Conditional edge: pick the right analysis node."""
-    if state.get("es_matches"):
+    matches = state.get("es_matches")
+    if matches:
+        best = matches[0]
+        score = float(best.get("score", 0))
+        solution = (best.get("solution") or "").strip()
+        if score >= _EXACT_MATCH_THRESHOLD and solution:
+            logger.info(
+                "Exact fingerprint match (score=%.4f) — returning cached solution",
+                score,
+            )
+            return "return_cached_solution"
         return "analyze_with_context"
     return "analyze_fresh"
 
@@ -168,6 +181,20 @@ def analyze_with_context(state: AnalysisState) -> dict:
         "matched_solution": best.get("solution", ""),
         "match_score": best.get("score", 0.0),
         "recommendation": "verified_past_solution",
+    }
+
+
+def return_cached_solution(state: AnalysisState) -> dict:
+    """Return a previously accepted solution without calling the LLM."""
+    best = state["es_matches"][0]
+    solution = best.get("solution", "")
+    score = float(best.get("score", 0))
+    return {
+        "analysis": f"**Exact match found** (similarity {score:.0%}) — returning previously accepted solution.",
+        "suggested_fix": solution,
+        "matched_solution": solution,
+        "match_score": score,
+        "recommendation": "cached_exact_match",
     }
 
 
@@ -246,14 +273,19 @@ def build_graph():
     builder.add_node("preprocess", preprocess)
     builder.add_node("analyze_with_context", analyze_with_context)
     builder.add_node("analyze_fresh", analyze_fresh)
+    builder.add_node("return_cached_solution", return_cached_solution)
 
     builder.set_entry_point("preprocess")
     builder.add_conditional_edges(
         "preprocess",
         _route,
-        {"analyze_with_context": "analyze_with_context",
-         "analyze_fresh": "analyze_fresh"},
+        {
+            "return_cached_solution": "return_cached_solution",
+            "analyze_with_context": "analyze_with_context",
+            "analyze_fresh": "analyze_fresh",
+        },
     )
+    builder.add_edge("return_cached_solution", END)
     builder.add_edge("analyze_with_context", END)
     builder.add_edge("analyze_fresh", END)
 

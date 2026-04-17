@@ -1,10 +1,5 @@
-{"timestamp":"00:00:01.447","source":"Server","level":"LOG","message":""}
-{"timestamp":"00:00:02.353","source":"Browser","level":"INFO","message":"%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold"}
-{"timestamp":"00:03:14.635","source":"Browser","level":"INFO","message":"%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold"}
-{"timestamp":"00:09:34.901","source":"Server","level":"LOG","message":"✓ Compiled in 136ms"}
-{"timestamp":"00:09:47.028","source":"Server","level":"LOG","message":"✓ Compiled in 91ms"}
-{"timestamp":"00:09:49.423","source":"Server","level":"LOG","message":"✓ Compiled in 181ms"}
-{"timestamp":"00:09:51.518","source":"Server","level":"LOG","message":"✓ Compiled in 614ms"}
-{"timestamp":"00:09:52.491","source":"Server","level":"LOG","message":"✓ Compiled in 209ms"}
-{"timestamp":"00:09:55.088","source":"Server","level":"LOG","message":"✓ Compiled in 490ms"}
-{"timestamp":"00:09:59.261","source":"Server","level":"LOG","message":"✓ Compiled in 215ms"}
+{"timestamp":"00:00:19.730","source":"Server","level":"LOG","message":""}
+{"timestamp":"00:00:23.026","source":"Browser","level":"INFO","message":"%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold"}
+{"timestamp":"00:01:06.247","source":"Browser","level":"INFO","message":"%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold"}
+{"timestamp":"00:03:12.435","source":"Server","level":"ERROR","message":"Failed to proxy http://host.docker.internal:8095/api/listener/poll-once Error: socket hang up"}
+{"timestamp":"00:03:12.436","source":"Server","level":"ERROR","message":"Error: socket hang up"}

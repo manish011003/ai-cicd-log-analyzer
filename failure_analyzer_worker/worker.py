@@ -180,6 +180,14 @@ def ingest_failure(
                 "build_url": event.build_url,
             })
 
+            fingerprint = state.get("fingerprint", "")
+            filtered_logs = state.get("filtered_logs", "")
+            if fingerprint and filtered_logs:
+                try:
+                    log_processor.store_filtered_context(fingerprint, filtered_logs)
+                except Exception:
+                    logger.warning("Failed to store filtered context in ES", exc_info=True)
+
             similar = state.get("es_matches") or []
             all_results.append({
                 "job_name": event.job_full_name,
@@ -187,8 +195,8 @@ def ingest_failure(
                 "build_url": event.build_url,
                 "correlation_id": event.correlation_id,
                 "stage_name": stage.stage_name,
-                "fingerprint": state.get("fingerprint", ""),
-                "filtered_logs": state.get("filtered_logs", ""),
+                "fingerprint": fingerprint,
+                "filtered_logs": filtered_logs,
                 "analysis": state.get("analysis", ""),
                 "suggested_fix": state.get("suggested_fix", ""),
                 "recommendation": state.get("recommendation", ""),

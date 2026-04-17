@@ -5,6 +5,7 @@ import { fetchDiagnostics, fetchResults, fetchStats, pollListenerOnce } from "@/
 import type { DiagnosticsResponse, ProcessedStage, StatsResponse } from "@/lib/types";
 import ChatPanel from "./ChatPanel";
 import FailureCard from "./FailureCard";
+import HistorySidebar from "./HistorySidebar";
 import StatsBar from "./StatsBar";
 
 const POLL_INTERVAL_MS = 10000;
@@ -23,6 +24,7 @@ export default function Dashboard() {
   const [diag, setDiag] = useState<DiagnosticsResponse | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | undefined>(undefined);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | undefined>(undefined);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = useCallback(
@@ -110,8 +112,36 @@ export default function Dashboard() {
       .slice(0, 5);
   }, [results]);
 
+  const groupedResults = useMemo(() => {
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterdayStart = new Date(todayStart.getTime() - 86_400_000);
+
+    const groups: { label: string; items: ProcessedStage[] }[] = [
+      { label: "Today", items: [] },
+      { label: "Yesterday", items: [] },
+      { label: "Older", items: [] },
+    ];
+
+    for (const r of results) {
+      const ts = new Date(r.timestamp);
+      if (ts >= todayStart) groups[0].items.push(r);
+      else if (ts >= yesterdayStart) groups[1].items.push(r);
+      else groups[2].items.push(r);
+    }
+
+    return groups.filter((g) => g.items.length > 0);
+  }, [results]);
+
   return (
     <div className="flex h-screen">
+      {chatOpen && (
+        <HistorySidebar
+          activeSessionId={selectedSessionId}
+          onSelectSession={(id) => setSelectedSessionId(id)}
+          onNewChat={() => setSelectedSessionId(undefined)}
+        />
+      )}
       <div className="flex flex-1 flex-col overflow-hidden">
         <header className="flex items-center justify-between border-b border-zinc-800/80 bg-zinc-950/80 px-6 py-4 backdrop-blur-sm">
           <div className="flex items-center gap-3">
@@ -141,12 +171,21 @@ export default function Dashboard() {
               type="button"
               onClick={() =>
                 void (async () => {
-                  await runListenerPoll();
-                  await load(activeFilter, true);
                   try {
-                    setDiag(await fetchDiagnostics());
-                  } catch {
-                    /* ignore */
+                    setRefreshing(true);
+                    await runListenerPoll();
+                    await load(activeFilter, true);
+                    try {
+                      setDiag(await fetchDiagnostics());
+                    } catch {
+                      /* diagnostics is non-critical */
+                    }
+                  } catch (err) {
+                    setPollWarning(
+                      err instanceof Error ? err.message : "Refresh failed — check that all services are running.",
+                    );
+                  } finally {
+                    setRefreshing(false);
                   }
                 })()
               }
@@ -233,21 +272,35 @@ export default function Dashboard() {
             )}
 
             {!loading && results.length > 0 && (
-              <div className="space-y-4">
+              <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <p className="text-xs font-medium text-zinc-500">
                     {results.length} failure{results.length !== 1 ? "s" : ""}
-                    {activeFilter && <span className="ml-1 text-zinc-600">filtered by "{activeFilter}"</span>}
+                    {activeFilter && <span className="ml-1 text-zinc-600">filtered by &quot;{activeFilter}&quot;</span>}
                   </p>
                 </div>
-                {results.map((stage, i) => (
-                  <div
-                    key={`${stage.run_id}-${stage.stage_name}-${i}`}
-                    className="animate-fade-in"
-                    style={{ animationDelay: `${i * 40}ms` }}
-                    onMouseEnter={() => setActiveRunId(stage.run_id)}
-                  >
-                    <FailureCard stage={stage} onFeedbackSaved={() => load(activeFilter, true)} />
+                {groupedResults.map((group) => (
+                  <div key={group.label} className="space-y-3">
+                    <div className="sticky top-0 z-10 -mx-6 bg-zinc-950/90 px-6 py-2 backdrop-blur-sm">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                        {group.label}
+                        <span className="ml-2 text-zinc-600">({group.items.length})</span>
+                      </h3>
+                    </div>
+                    {group.items.map((stage, i) => (
+                      <div
+                        key={`${stage.run_id}-${stage.stage_name}-${i}`}
+                        className="animate-fade-in"
+                        style={{ animationDelay: `${i * 40}ms` }}
+                        onMouseEnter={() => setActiveRunId(stage.run_id)}
+                        onClick={() => {
+                          setSelectedSessionId(stage.run_id);
+                          setChatOpen(true);
+                        }}
+                      >
+                        <FailureCard stage={stage} onFeedbackSaved={() => load(activeFilter, true)} />
+                      </div>
+                    ))}
                   </div>
                 ))}
               </div>
@@ -258,7 +311,12 @@ export default function Dashboard() {
 
       {chatOpen && (
         <div className="w-[390px] shrink-0 animate-slide-in-right">
-          <ChatPanel open={chatOpen} activeRunId={activeRunId} onClose={() => setChatOpen(false)} />
+          <ChatPanel
+            open={chatOpen}
+            activeRunId={activeRunId}
+            sessionId={selectedSessionId}
+            onClose={() => setChatOpen(false)}
+          />
         </div>
       )}
     </div>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -1020,11 +1021,11 @@ def store_solution(
 
 
 def store_filtered_context(fingerprint: str, filtered_excerpt: str) -> str:
-    """Store a filtered-log excerpt for retrieval keyed by fingerprint embedding."""
+    """Store a filtered-log excerpt keyed by fingerprint. Deterministic ID prevents duplicates."""
     es = _get_es_client()
     ensure_context_index()
     vector = embed_text(fingerprint)
-    doc_id = str(uuid.uuid4())
+    doc_id = hashlib.sha256(fingerprint.encode()).hexdigest()
     es.index(
         index=settings.elasticsearch_context_index,
         id=doc_id,
@@ -1035,7 +1036,7 @@ def store_filtered_context(fingerprint: str, filtered_excerpt: str) -> str:
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
-    logger.info("Stored context snippet doc_id=%s", doc_id)
+    logger.info("Stored context snippet doc_id=%s (dedup by fingerprint hash)", doc_id)
     return doc_id
 
 

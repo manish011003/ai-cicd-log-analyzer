@@ -57,3 +57,17 @@ export interface DiagnosticsResponse {
   worker_http_reachable: boolean;
   worker_http_error: string | null;
 }
+
+export interface SessionListItem {
+  id: string;
+  job_full_name: string;
+  build_number: number;
+  stage_name: string;
+  feedback_status: string;
+  created_at: string;
+}
+
+export interface SessionDetail {
+  session: Record<string, unknown>;
+  messages: ChatMessage[];
+}

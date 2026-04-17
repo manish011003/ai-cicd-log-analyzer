@@ -3,6 +3,8 @@ import type {
   DiagnosticsResponse,
   ListenerPollResponse,
   ResultsResponse,
+  SessionDetail,
+  SessionListItem,
   StatsResponse,
 } from "./types";
 
@@ -63,4 +65,12 @@ export async function sendChatMessage(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, run_id: runId ?? "" }),
   });
+}
+
+export async function fetchSessions(): Promise<SessionListItem[]> {
+  return readJson<SessionListItem[]>(`${BASE}/sessions`);
+}
+
+export async function fetchSession(id: string): Promise<SessionDetail> {
+  return readJson<SessionDetail>(`${BASE}/sessions/${encodeURIComponent(id)}`);
 }
