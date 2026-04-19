@@ -44,4 +44,5 @@ failure_analyzer_worker/980.txt
 project_tree.txt
 
 # Local docs that should not ship with the repo
-AI_Log_Analyzer_Requirements_Enhanced.pdf
+.cursor
+graphify-out

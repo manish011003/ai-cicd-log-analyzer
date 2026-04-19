@@ -40,14 +40,16 @@ _SYSTEM_PROMPT = (
     "You are a senior CI/CD failure analyst. You help developers understand "
     "and resolve Jenkins build failures. Give concise, actionable answers "
     "with step-by-step fix instructions. Include exact commands and file "
-    "changes. Keep the total response under 400 words. Use markdown headings. "
-    "Never mention retrieval, similarity scores, or whether a past incident "
-    "\"matched\" the current failure—only describe the failure and the fix."
+    "changes. Keep the total response under 400 words. Always use the exact "
+    "markdown headings the user requests (## Analysis, ## Step-by-Step Fix, "
+    "## Verify). Never mention retrieval, similarity scores, embeddings, or "
+    "whether a past incident \"matched\" the current failure."
 )
 
 _WITH_CONTEXT_TEMPLATE = """\
 A Jenkins build has failed. Below are the filtered error logs and a \
-reference resolution from a prior incident that may apply.
+possibly-related prior incident. The prior incident may or may not apply -- \
+judge from the logs.
 
 **Job:** {job_name} #{build_number}
 **Stage:** {stage_name}
@@ -57,22 +59,28 @@ reference resolution from a prior incident that may apply.
 {filtered_logs}
 ```
 
-## Reference: prior incident and verified fix
+## Possibly-Related Prior Incident
 **Past fingerprint:** {past_fingerprint}
-**Resolution:**
+**Resolution from that incident:**
 {past_solution}
 
-Instructions:
-1. **Analysis** – explain what failed and why using the logs alone. You may use \
-the reference fix as grounding, but **do not** mention similarity scores, \
-"exact match", "partial match", retrieval, embeddings, or that the answer came \
-from a database or prior ticket. **Do not** state whether a match was found. \
-Start directly with the substantive diagnosis (symptoms, root cause, context).
-2. **Step-by-Step Fix** – numbered steps with exact commands or file changes \
-in code blocks. Each step should be clear enough to follow without guessing.
-3. **Verify** – one command or check to confirm the fix worked.
+Respond using exactly these markdown headings, in this order:
 
-Keep the total response under 400 words."""
+## Analysis
+A short paragraph explaining what went wrong and why, grounded in the logs \
+above. If the prior incident clearly does NOT match (different exception, \
+different service, different exit code), ignore it and diagnose from the \
+logs alone -- do NOT mention the prior incident, similarity, retrieval, or \
+matching.
+
+## Step-by-Step Fix
+Numbered steps with exact commands or file changes in code blocks. Each step \
+should be clear enough to follow without guessing.
+
+## Verify
+One command or check to confirm the fix worked.
+
+Total response under 400 words."""
 
 _FRESH_TEMPLATE = """\
 A Jenkins build has failed. Below are the filtered error logs.
@@ -85,15 +93,21 @@ A Jenkins build has failed. Below are the filtered error logs.
 {filtered_logs}
 ```
 
-Analyze the failure and provide:
+Respond using exactly these markdown headings, in this order:
 
-1. **Analysis** – a short paragraph explaining what went wrong and why, with \
-enough technical context for the developer to understand the issue.
-2. **Step-by-Step Fix** – numbered steps with exact commands or file changes \
-in code blocks. Each step should be clear enough to follow without guessing.
-3. **Verify** – one command or check to confirm the fix worked.
+## Analysis
+A short paragraph explaining what went wrong and why, with enough technical \
+context for the developer to understand the issue. Ground your reasoning in \
+the logs above.
 
-Keep the total response under 400 words."""
+## Step-by-Step Fix
+Numbered steps with exact commands or file changes in code blocks. Each step \
+should be clear enough to follow without guessing.
+
+## Verify
+One command or check to confirm the fix worked.
+
+Total response under 400 words."""
 
 
 def preprocess(state: AnalysisState) -> dict:
@@ -120,21 +134,31 @@ def preprocess(state: AnalysisState) -> dict:
 
 
 def _route(state: AnalysisState) -> str:
-    """Conditional edge: pick the right analysis node."""
-    if state.get("es_matches"):
+    """Only use a past solution if it confidently clears the threshold.
+
+    ``search_similar_solutions`` already filters by ``SIMILARITY_THRESHOLD``,
+    so a non-empty ``es_matches`` here means at least one strong neighbour.
+    Re-check defensively in case the search ever returns weaker hits.
+    """
+    matches = state.get("es_matches") or []
+    if matches and float(matches[0].get("score") or 0.0) >= settings.similarity_threshold:
         return "analyze_with_context"
     return "analyze_fresh"
 
 
 def _split_response(content: str) -> tuple[str, str]:
-    """Split on the first ``## Step-by-Step Fix`` heading into (analysis, suggested_fix)."""
+    """Split on the first ``Step-by-Step Fix`` marker into (analysis, suggested_fix).
+
+    Tolerates either a markdown heading (``## Step-by-Step Fix``) or a bold
+    list item (``2. **Step-by-Step Fix**``) so the splitter still works if
+    the LLM drifts from the requested heading style.
+    """
     pattern = re.compile(
-        r"(?m)^#{1,6}\s*Step-by-Step\s+Fix",
-        re.IGNORECASE,
+        r"(?im)^(?:#{1,6}\s*|\d+\.\s*\**)Step[-\s]?by[-\s]?Step\s+Fix\**",
     )
     match = pattern.search(content)
     if match:
-        return content[:match.start()].strip(), content[match.start():].strip()
+        return content[: match.start()].strip(), content[match.start() :].strip()
     return content.strip(), ""
 
 

@@ -3,10 +3,7 @@
 Usage (from repo root)::
 
     python failure_analyzer_worker/try_filter.py path/to/log.txt
-    python failure_analyzer_worker/try_filter.py --legacy path/to/log.txt
     type log.txt | python failure_analyzer_worker/try_filter.py
-
-``--legacy`` sets ``LOG_FILTER_LEGACY=1`` before loading settings (old regex-only path).
 
 ``--metadata`` prepends the ``LogProcessor`` metadata header + trims body to ``LOG_BODY_MAX_CHARS``.
 """
@@ -14,7 +11,6 @@ Usage (from repo root)::
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -52,14 +48,9 @@ def main() -> None:
         description="Print filter_logs() output for manual pipeline checks.",
     )
     parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="use legacy global-regex-only filter (same as LOG_FILTER_LEGACY=1)",
-    )
-    parser.add_argument(
         "--metadata",
         action="store_true",
-        help="prepend [METADATA SUMMARY] block (same as worker graph / LogProcessor)",
+        help="prepend [METADATA] block (same as worker graph / LogProcessor)",
     )
     parser.add_argument(
         "path",
@@ -68,9 +59,6 @@ def main() -> None:
         help="log file to read (omit: use stdin when piped, else a tiny sample)",
     )
     args = parser.parse_args()
-
-    if args.legacy:
-        os.environ["LOG_FILTER_LEGACY"] = "1"
 
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))

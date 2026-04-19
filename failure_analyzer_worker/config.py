@@ -79,47 +79,10 @@ class WorkerSettings(BaseSettings):
         default="http://127.0.0.1:3000", alias="WEB_UI_PUBLIC_URL"
     )
 
-    # Log filtering pipeline (normalize → partition → dedupe → anchors → noise)
-    log_filter_legacy: bool = Field(default=False, alias="LOG_FILTER_LEGACY")
-    log_max_filtered_chars: int = Field(default=16000, alias="LOG_MAX_FILTERED_CHARS")
-    log_anchor_before_lines: int = Field(default=14, alias="LOG_ANCHOR_BEFORE_LINES")
-    log_anchor_after_lines: int = Field(default=18, alias="LOG_ANCHOR_AFTER_LINES")
-    log_anchor_context_before: int = Field(
-        default=2,
-        alias="LOG_ANCHOR_CONTEXT_BEFORE",
-    )
-    log_dedupe_min_consecutive: int = Field(
-        default=4,
-        alias="LOG_DEDUPE_MIN_CONSECUTIVE",
-    )
-    log_partition_by_service: bool = Field(
-        default=True, alias="LOG_PARTITION_BY_SERVICE"
-    )
-    # Prefer earliest anchors in file order (often root cause before cascade).
-    log_anchor_chronological: bool = Field(default=True, alias="LOG_ANCHOR_CHRONOLOGICAL")
-    log_anchor_max_points: int = Field(default=12, alias="LOG_ANCHOR_MAX_POINTS")
-    log_first_failure_min_score: int = Field(
-        default=4, alias="LOG_FIRST_FAILURE_MIN_SCORE"
-    )
-    log_shrink_later_buckets: bool = Field(default=True, alias="LOG_SHRINK_LATER_BUCKETS")
-    log_later_bucket_after_lines: int = Field(
-        default=8, alias="LOG_LATER_BUCKET_AFTER_LINES"
-    )
-    log_later_bucket_before_lines: int = Field(
-        default=8, alias="LOG_LATER_BUCKET_BEFORE_LINES"
-    )
-    log_later_bucket_max_chars: int = Field(
-        default=4200, alias="LOG_LATER_BUCKET_MAX_CHARS"
-    )
-    log_dedupe_same_root_bucket: bool = Field(
-        default=True, alias="LOG_DEDUPE_SAME_ROOT_BUCKET"
-    )
-    # Collapse runs of spaces/tabs per line so ``len(filtered_logs)`` counts fewer chars.
-    log_compress_whitespace: bool = Field(
-        default=True, alias="LOG_COMPRESS_WHITESPACE"
-    )
-    # Max chars for the log body in ``LogProcessor`` output (metadata is outside this cap).
-    log_body_max_chars: int = Field(default=5000, alias="LOG_BODY_MAX_CHARS")
+    # Log body cap (metadata header is outside this cap).
+    # The listener already crops the log to the relevant region; the worker
+    # only cleans timestamps/noise/dupes and trims to this cap if needed.
+    log_body_max_chars: int = Field(default=8000, alias="LOG_BODY_MAX_CHARS")
 
 
 settings = WorkerSettings()
