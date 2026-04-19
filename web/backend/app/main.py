@@ -36,9 +36,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="CI Analyzer Web API", lifespan=lifespan)
+
+# CORS_ORIGINS is a comma-separated list (or "*" for any origin).
+_cors_origins = [o.strip() for o in (settings.cors_origins or "*").split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

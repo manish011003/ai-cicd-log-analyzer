@@ -1,17 +1,43 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import { ThemeProvider } from "@/components/theme-provider";
 
-const inter = Inter({
+// Self-hosted variable fonts. Files live under web/frontend/app/fonts/ so
+// `next/font/local` can resolve them without leaving the `app/` boundary
+// (Turbopack rejects `..` traversal) and so the Docker build does not need
+// to reach fonts.googleapis.com.
+const inter = localFont({
+  src: [
+    {
+      path: "./fonts/Inter-VariableFont.woff2",
+      style: "normal",
+      weight: "100 900",
+    },
+    {
+      path: "./fonts/Inter-Italic-VariableFont.woff2",
+      style: "italic",
+      weight: "100 900",
+    },
+  ],
   variable: "--font-ui",
-  subsets: ["latin"],
   display: "swap",
 });
 
-const jetbrainsMono = JetBrains_Mono({
+const jetbrainsMono = localFont({
+  src: [
+    {
+      path: "./fonts/JetBrainsMono-VariableFont.woff2",
+      style: "normal",
+      weight: "100 800",
+    },
+    {
+      path: "./fonts/JetBrainsMono-Italic-VariableFont.woff2",
+      style: "italic",
+      weight: "100 800",
+    },
+  ],
   variable: "--font-mono",
-  subsets: ["latin"],
   display: "swap",
 });
 

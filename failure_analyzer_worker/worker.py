@@ -7,6 +7,7 @@ in listener and worker ``.env`` files. Routes: ``/ingest/failure``, ``/store-sol
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -20,7 +21,40 @@ from .graph import analysis_graph, chat_clarification_reply
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Failure Analyzer Worker")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    logger.info(
+        "Worker starting  port=%s  api_key_set=%s",
+        settings.worker_port,
+        bool(settings.worker_api_key),
+    )
+    logger.info(
+        "Expecting events from jenkins_failure_listener "
+        "(listener WORKER_INGEST_URL should be "
+        "http://%s:%s/ingest/failure)",
+        settings.worker_host,
+        settings.worker_port,
+    )
+    try:
+        log_processor.reset_es_client()
+        log_processor.ensure_index()
+        log_processor.ensure_context_index()
+        log_processor.prune_stale_documents()
+        logger.info(
+            "ES index ready: %s  url=%s",
+            settings.elasticsearch_index,
+            settings.elasticsearch_url,
+        )
+    except Exception:
+        logger.warning(
+            "ES index creation skipped (ES may not be reachable yet)",
+            exc_info=True,
+        )
+    yield
+
+
+app = FastAPI(title="Failure Analyzer Worker", lifespan=lifespan)
 
 
 class FailedStagePayload(BaseModel):
@@ -65,37 +99,6 @@ class ChatTurnRequest(BaseModel):
     build_number: int = 0
     analysis: str = ""
     suggested_fix: str = ""
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    logger.info(
-        "Worker starting  port=%s  api_key_set=%s",
-        settings.worker_port,
-        bool(settings.worker_api_key),
-    )
-    logger.info(
-        "Expecting events from jenkins_failure_listener "
-        "(listener WORKER_INGEST_URL should be "
-        "http://%s:%s/ingest/failure)",
-        settings.worker_host,
-        settings.worker_port,
-    )
-    try:
-        log_processor.reset_es_client()
-        log_processor.ensure_index()
-        log_processor.ensure_context_index()
-        log_processor.prune_stale_documents()
-        logger.info(
-            "ES index ready: %s  url=%s",
-            settings.elasticsearch_index,
-            settings.elasticsearch_url,
-        )
-    except Exception:
-        logger.warning(
-            "ES index creation skipped (ES may not be reachable yet)",
-            exc_info=True,
-        )
 
 
 def _verify_api_key(key: str) -> None:

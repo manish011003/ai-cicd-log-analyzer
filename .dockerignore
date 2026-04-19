@@ -1,20 +1,49 @@
 .git
+.gitignore
+.dockerignore
+docker-compose*.yml
+docker-compose.env.example
+README.md
+docs/
+
+# Python
 **/.venv
+**/.venv-worker
 **/venv
 **/env
 **/__pycache__
 **/*.py[cod]
 **/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/dist
+**/build
+**/*.egg-info
+
+# Node / Next.js
 **/node_modules
 **/.next
+**/.next/dev
+**/.turbo
+**/*.tsbuildinfo
+
+# Env files (never ship .env into images; .env.example is fine)
 .env
 **/.env
 !**/.env.example
+
+# IDE / OS
 **/.idea
 **/.vscode
 **/Thumbs.db
 **/.DS_Store
-*.egg-info
+
+# Logs / scratch
+**/*.log
 **/samplelog.txt
 failure_analyzer_worker/980.txt
-web/**/*.log
+
+# Misc local artefacts
+AI_Log_Analyzer_Requirements_Enhanced.pdf
+project_tree.txt

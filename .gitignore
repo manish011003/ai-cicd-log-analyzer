@@ -1,31 +1,47 @@
-# Virtual environments
+# Python
 .venv/
 venv/
 env/
 .venv-worker/
-
-# Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Environment files with secrets
 .env
+*.env
+!*.env.example
+!.env.example
 
-# IDE
+# Node / Next.js
+node_modules/
+.next/
+.next/dev/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# IDE / Editor
 .vscode/
 .idea/
+*.swp
 
 # OS
 Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Node
-node_modules/
-.next/
+# Local logs / scratch
+*.log
+samplelog.txt
+failure_analyzer_worker/980.txt
+project_tree.txt
 
-# Distribution / packaging
-*.egg-info/
-dist/
-build/
+# Local docs that should not ship with the repo
+AI_Log_Analyzer_Requirements_Enhanced.pdf

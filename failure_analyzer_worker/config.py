@@ -64,6 +64,9 @@ class WorkerSettings(BaseSettings):
     llm_model: str = Field(default="llama-3.3-70b-versatile", alias="LLM_MODEL")
     llm_temperature: float = Field(default=0.1, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=2048, alias="LLM_MAX_TOKENS")
+    # Set to "0"/"false" only when running behind a corporate MITM proxy
+    # with a self-signed root CA. Default verifies TLS.
+    llm_tls_verify: str = Field(default="1", alias="LLM_TLS_VERIFY")
 
     # Worker HTTP
     worker_host: str = Field(default="127.0.0.1", alias="WORKER_HOST")

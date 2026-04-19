@@ -182,7 +182,16 @@ def _strip_match_status_preamble(text: str) -> str:
 
 
 def _get_llm() -> ChatGroq:
-    http_client = httpx.Client(verify=False)
+    # Honor LLM_TLS_VERIFY=0/false to allow corporate proxies with self-signed certs
+    # (defaults to verifying). Never silently disable verification.
+    verify_env = (settings.llm_tls_verify or "").strip().lower()
+    verify: bool = verify_env not in {"0", "false", "no", "off"}
+    if not verify:
+        logger.warning(
+            "LLM_TLS_VERIFY is disabled — Groq TLS certificate will not be checked. "
+            "Use this only behind a trusted MITM proxy.",
+        )
+    http_client = httpx.Client(verify=verify)
     return ChatGroq(
         model=settings.llm_model,
         temperature=settings.llm_temperature,

@@ -93,6 +93,9 @@ services:
       ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      # Set LLM_TLS_VERIFY=0 in .env to disable TLS cert checking on Groq calls
+      # (only needed behind a corporate MITM proxy with a self-signed root CA).
+      LLM_TLS_VERIFY: ${LLM_TLS_VERIFY:-1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
       WEB_UI_API_URL: http://web-backend:8095
       WEB_UI_PUBLIC_URL: ${WEB_UI_PUBLIC_URL:-http://localhost:3080}
