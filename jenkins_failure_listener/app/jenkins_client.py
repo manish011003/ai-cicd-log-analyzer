@@ -67,7 +67,7 @@ def _log_error_pattern_bundle() -> tuple[re.Pattern[str], re.Pattern[str], re.Pa
         r"\bnon-zero\s+exit\b|"
         r"\bFAILED\b|"
         r"\b(?:ECONNREFUSED|ETIMEDOUT|ENOTFOUND|ECONNRESET)\b|"
-        r"\b(?:could not|couldn't|unable to)\s+(?:connect|reach|resolve|open|load)\b|"
+        r"\b(?:could not|couldn't|unable to)\s+(?:connect|reach|resolve|open|load|find|start|create)\b|"
         r"connection\s+refused|connection\s+reset|broken\s+pipe|"
         r"timed\s+out\s+waiting|"
         r"\bcaused\s+by\s*:\s*\S+|"
@@ -82,7 +82,27 @@ def _log_error_pattern_bundle() -> tuple[re.Pattern[str], re.Pattern[str], re.Pa
         r"re-run\s+maven|for\s+more\s+information\s+about|^\s*---+\s*$|"
         r"cwiki\.apache\.org|\[help\s*1\]|full\s+debug\s+logging|"
         r"^\s*Downloading\s|^\s*Progress\s*\(|Resolving\s+dependencies|"
-        r"^\s*\+\+\+\s",
+        r"^\s*\+\+\+\s|"
+        # Spring Cloud / Eureka / Netflix infrastructure retry noise
+        r"Request execution error.*endpoint=DefaultEndpoint|"
+        r"Request execution failed with message:|"
+        r"Cannot execute request on any known server|"
+        r"was unable to refresh its cache|"
+        r"Initial registry fetch from.*servers failed|"
+        r"registration failed Cannot execute|"
+        r"ConfigServerConfigDataLoader\s*:|"
+        r"Fetching config from server at|"
+        r"Exception on Url\s*-\s*http://localhost|"
+        r"jakarta\.ws\.rs\.ProcessingException:\s*java\.net\.Connect|"
+        r"HttpHostConnectException:\s*Connect to http://localhost|"
+        r"TransportException:\s*Cannot execute request|"
+        r"ResourceAccessException:.*Connection refused|"
+        r"Caused by:\s*java\.net\.ConnectException:\s*Connection refused|"
+        r"Caused by:\s*org\.apache\.maven\.plugin\.MojoFailureException|"
+        r"LifecycleExecutionException:\s*Failed to execute goal|"
+        r"See /var/jenkins_home/.*surefire-reports|"
+        r"See dump files \(if any exist\)|"
+        r"OptionalValidatorFactoryBean.*no.*provider",
     )
     operational_hint = re.compile(
         r"(?i)\b(?:connection|timeout|timed\s+out|socket|dns|network|unreachable|"
@@ -120,38 +140,68 @@ def _score_line_as_error_anchor(line: str) -> int | None:
     return score
 
 
+# Flexible prefix: zero or more timestamps in [ISO], bare ISO, or HH:MM:SS format.
+# Handles consoleText double-timestamps: [2026-04-20T07:34:28.291Z] 2026-04-20T07:34:27.518Z
+_TS = r"(?:\[\d{4}-[^\]]+\]\s*|\d{4}-\d{2}-\d{2}T\S+\s+|\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)*"
+
 _LOG_NOISE_LINE = re.compile(
-    r"(?i)"
-    r"^\s*$|"
-    # [Pipeline] boilerplate
-    r"^\s*\[Pipeline\]\s*(?:\{|\}|//\s*\w+|$)|"
-    r"^\s*\[Pipeline\]\s*(?:stage|node|parallel|withEnv|timestamps|timeout|getContext|End of Pipeline)\b|"
+    rf"(?i)"
+    rf"^\s*$|"
+    # [Pipeline] boilerplate (with optional leading timestamp for consoleText)
+    rf"^\s*{_TS}\[Pipeline\]\s*(?:\{{|\}}|//\s*\w+|$)|"
+    rf"^\s*{_TS}\[Pipeline\]\s*(?:stage|node|parallel|withEnv|timestamps|timeout|"
+    rf"getContext|End of Pipeline|tool|envVarsForTool)\b|"
     # Maven / Gradle progress lines with no error value
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*[-=]{4,}\s*$|"
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*$|"
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[INFO\]\s*(?:Scanning for projects|"
-    r"Building\s|Compiling\s|Copying\s|Installing\s|Deleting\s|Recompiling\s|"
-    r"Downloaded\s|Downloading\s|Progress\s|Resolving\s|"
-    r"--- \S+:\S+:\S+ .* ---\s*$|"
-    r"BUILD SUCCESS|Total time:|Finished at:)|"
+    rf"^\s*{_TS}\[INFO\]\s*[-=]{{4,}}\s*$|"
+    rf"^\s*{_TS}\[INFO\]\s*$|"
+    rf"^\s*{_TS}\[INFO\]\s*(?:Scanning for projects|"
+    rf"Building\s|Compiling\s|Copying\s|Installing\s|Deleting\s|Recompiling\s|"
+    rf"Downloaded\s|Downloading\s|Progress\s|Resolving\s|"
+    rf"--- \S+:\S+:\S+ .* ---\s*$|"
+    rf"BUILD SUCCESS|Total time:|Finished at:)|"
     # Maven WARNING lines about dependency model / pom issues
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?\[WARNING\]\s*(?:$|'dependencies|"
-    r"Some problems were|It is highly recommended|"
-    r"\s*from pom\.xml)|"
+    rf"^\s*{_TS}\[WARNING\]\s*(?:$|'dependencies|"
+    rf"Some problems were|It is highly recommended|"
+    rf"\s*from pom\.xml)|"
     # Bare timestamp-only or marker-only lines
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?(?:Started by|Running in|"
-    r"Checking out Revision|using credential|"
-    r"\> git\s|Cloning repository)\b|"
-    # Spring Boot / Spring Cloud INFO noise (config client retries, banners)
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*ConfigServerConfigDataLoader\s*:|"
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*Fetching config from server at\s*:|"
-    r"^\s*(?:\[?\d{4}[^\]]*\]?\s*)?INFO\s+.*Exception on Url\s*-|"
-    r"^\s*::\s*Spring Boot ::|"
-    r"^\s*\(v\d+\.\d+\.\d+\)\s*$|"
+    rf"^\s*{_TS}(?:Started by|Running in|Timeout set to expire|"
+    rf"Checking out Revision|using credential|Fetching changes|"
+    rf"Fetching upstream changes|Commit message:|"
+    rf"\> git\s|Cloning repository)\b|"
+    # ---- Spring Cloud / Eureka / Netflix infrastructure noise ----
+    # Uses .* prefix because .match() anchors to start; class names are mid-line.
+    rf".*ConfigServerConfigDataLoader\s*:.*(?:Fetching config|Exception on Url|Connect to .* failed)|"
+    rf".*Fetching config from server at\s*:|"
+    rf".*RedirectingEurekaHttpClient\s*:.*Request execution error|"
+    rf".*RetryableEurekaHttpClient\s*:.*Request execution failed|"
+    rf".*DiscoveryClient\S*\s.*(?:was unable to refresh|Cannot execute request|"
+    rf"Initial registry fetch|registration failed|DiscoveryClient_)\b|"
+    rf".*OptionalValidatorFactoryBean\s*:.*Failed to set up a Bean Validation provider|"
+    rf".*TransportException:\s*Cannot execute request on any known server|"
+    rf".*jakarta\.ws\.rs\.ProcessingException:\s*java\.net\.ConnectException|"
+    rf".*HttpHostConnectException:\s*Connect to http://localhost:\d+\s+failed|"
+    rf".*ResourceAccessException:.*Connection refused|"
+    rf".*Caused by:\s*java\.net\.ConnectException:\s*Connection refused|"
+    # Eureka / Netflix / Jersey / Maven infrastructure stack trace interior
+    rf"^\s*{_TS}?\s*at\s+(?:com\.netflix\.discovery\.|org\.glassfish\.jersey\.|"
+    rf"jakarta\.ws\.rs\.|org\.apache\.hc\.client5\.|org\.apache\.hc\.core5\.|"
+    rf"org\.springframework\.web\.client\.DefaultRestClient|"
+    rf"org\.apache\.maven\.lifecycle\.|org\.apache\.maven\.plugin\.|"
+    rf"org\.apache\.maven\.DefaultMaven\.|org\.apache\.maven\.cli\.|"
+    rf"org\.codehaus\.plexus\.|org\.apache\.maven\.plugin\.surefire\.)\b|"
+    rf"^\s*{_TS}?\s*\.\.\.\s+\d+\s+more\s*$|"
+    # Spring Boot banner / startup noise
+    rf"::\s*Spring Boot\s*::|"
+    rf"^\s*{_TS}?\(v\d+\.\d+\.\d+\)\s*$|"
     # Maven Surefire / test harness chatter
-    r"^\[INFO\]\s+(?:Running com\.|Surefire report directory:|Using auto detected provider|T E S T S)\b|"
-    r"^\s*Mockito is currently self-attaching|"
-    r"^\s*WARNING:\s+A (?:Java agent|terminally deprecated method)"
+    rf"^\s*{_TS}?\[INFO\]\s+(?:Running com\.|Surefire report directory:|"
+    rf"Using auto detected provider|T E S T S)\b|"
+    rf"Mockito is currently self-attaching|"
+    rf"WARNING:\s+A (?:Java agent|terminally deprecated method|restricted method)|"
+    rf"WARNING:\s+sun\.misc\.Unsafe|WARNING:\s+Please consider reporting|"
+    rf"WARNING:\s+.*will be removed in a future release|"
+    rf"WARNING:\s+.*Use --enable-native-access|"
+    rf"WARNING:\s+Restricted methods will be blocked"
 )
 
 
@@ -387,31 +437,48 @@ class JenkinsClient:
         ]
 
     def _select_root_failure_stages(self, stages: list[dict]) -> list[dict]:
-        """Return the earliest failed stage and any parallel siblings that failed
-        within ``parallel_stage_overlap_ms`` of it.
+        """Return only the root-cause failed stages — no sequential cascades.
 
-        If the first failure sits inside a parallel block, other branches that
-        started around the same time are included so the caller sees every
-        independent failure.  Sequential (non-parallel) cascade stages are
-        excluded.
+        Builds execution-overlap groups from *all* stages: consecutive stages
+        (sorted by start time) that begin while any member of the current
+        group is still running are placed in the same group (= parallel
+        siblings).  Returns the failed stages from the earliest group that
+        contains at least one failure.
         """
-        error_statuses = {"FAILED", "ERROR", "ABORTED"}
-        failed = [
-            s for s in stages if str(s.get("status", "")).upper() in error_statuses
-        ]
-        if not failed:
+        if not stages:
             return []
 
-        failed.sort(key=lambda s: int(s.get("startTimeMillis") or 0))
-        earliest = failed[0]
-        earliest_start = int(earliest.get("startTimeMillis") or 0)
+        error_statuses = {"FAILED", "ERROR", "ABORTED"}
+        ordered = sorted(stages, key=lambda s: int(s.get("startTimeMillis") or 0))
 
-        result = [earliest]
-        for s in failed[1:]:
+        groups: list[list[dict]] = []
+        cur_group: list[dict] = [ordered[0]]
+        group_end = (
+            int(ordered[0].get("startTimeMillis") or 0)
+            + int(ordered[0].get("durationMillis") or 0)
+        )
+
+        for s in ordered[1:]:
             s_start = int(s.get("startTimeMillis") or 0)
-            if abs(s_start - earliest_start) <= self.parallel_stage_overlap_ms:
-                result.append(s)
-        return result
+            s_end = s_start + int(s.get("durationMillis") or 0)
+            if s_start < group_end:
+                cur_group.append(s)
+                group_end = max(group_end, s_end)
+            else:
+                groups.append(cur_group)
+                cur_group = [s]
+                group_end = s_end
+        groups.append(cur_group)
+
+        for group in groups:
+            failed_in_group = [
+                s for s in group
+                if str(s.get("status", "")).upper() in error_statuses
+            ]
+            if failed_in_group:
+                return failed_in_group
+
+        return []
 
     def _stage_log_excerpt(
         self, job_full_name: str, build_number: int, stage_id: str | None, stage_name: str
@@ -424,13 +491,12 @@ class JenkinsClient:
         text = self._fetch_node_log_text(job_path, build_number, stage_id)
         if text:
             logger.info("%s: using stage node log (%d chars)", tag, len(text))
-            return self._stage_error_snippets(text)
+            return _truncate_log_chars(text, self.max_stage_log_chars)
 
-        # Parent stage node returned empty -- walk stageFlowNodes children.
         child_text = self._fetch_child_node_logs(job_path, build_number, stage_id)
         if child_text:
             logger.info("%s: using child node logs (%d chars)", tag, len(child_text))
-            return self._stage_error_snippets(child_text)
+            return _truncate_log_chars(child_text, self.max_stage_log_chars)
 
         logger.info("%s: no stage-scoped log, falling back to consoleText", tag)
         return ""
@@ -489,28 +555,21 @@ class JenkinsClient:
         return response.text or ""
 
     def _full_console_excerpt(self, console_text: str) -> str:
-        """Derive an error-oriented excerpt from full console output.
+        """Return full console output (truncated to size limit).
 
         Used for freestyle / non-workflow jobs (no wfapi stage logs) and whenever
         Pipeline stage-specific excerpts are empty.
         """
         if not (console_text or "").strip():
             return ""
-        raw = console_text.strip()
-        excerpt = self._stage_error_snippets(raw).strip()
-        if excerpt:
-            return excerpt
-        excerpt = self._first_cause_excerpt(raw).strip()
-        if excerpt:
-            return excerpt
-        return _truncate_log_chars(raw, self.max_stage_log_chars)
+        return _truncate_log_chars(console_text.strip(), self.max_stage_log_chars)
 
     def _extract_stage_excerpt_from_console(self, console_text: str, stage_name: str) -> str:
-        """Extract error snippets from consoleText, narrowing to the stage section when possible.
+        """Extract the stage section from consoleText using Pipeline markers.
 
-        First tries to locate the stage by ``(stage_name)`` markers that Jenkins Pipeline
-        emits, then runs error-snippet extraction on that narrowed window.  Falls back to
-        the full console text only when no stage markers are found.
+        Locates the stage by ``(stage_name)`` markers that Jenkins Pipeline emits and
+        returns the surrounding window.  Falls back to the full console text when no
+        stage markers are found.
         """
         if not console_text:
             return ""
@@ -527,11 +586,9 @@ class JenkinsClient:
             start = max(0, center - 50)
             end = min(len(lines), center + 150)
             window_text = "\n".join(lines[start:end])
-            snippet = self._stage_error_snippets(window_text)
-            if snippet and self._has_real_error_signals(snippet):
-                return snippet
+            return _truncate_log_chars(window_text, self.max_stage_log_chars)
 
-        return self._stage_error_snippets(console_text)
+        return _truncate_log_chars(console_text, self.max_stage_log_chars)
 
     def _stage_error_snippets(self, text: str) -> str:
         """5-8 lines around each error signal, with overlapping windows merged.
@@ -543,7 +600,7 @@ class JenkinsClient:
         if not lines:
             return ""
         n = min(len(lines), self.max_stage_scan_lines)
-        bounded = lines[:n]
+        bounded = lines[-n:] if len(lines) > n else lines
         before = max(0, self.per_error_context_before)
         after = max(0, self.per_error_context_after)
         merge_gap = max(0, self.error_anchor_merge_gap_lines)
