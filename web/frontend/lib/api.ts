@@ -3,6 +3,7 @@ import type {
   DiagnosticsResponse,
   ListenerPollResponse,
   ResultsResponse,
+  SessionDetail,
   StatsResponse,
 } from "./types";
 
@@ -57,10 +58,19 @@ export async function setFeedback(
 export async function sendChatMessage(
   message: string,
   runId?: string,
+  options?: { useFullLog?: boolean },
 ): Promise<ChatResponse> {
   return readJson<ChatResponse>(`${AGENT}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, run_id: runId ?? "" }),
+    body: JSON.stringify({
+      message,
+      run_id: runId ?? "",
+      use_full_log: options?.useFullLog ?? false,
+    }),
   });
+}
+
+export async function fetchSessionDetail(runId: string): Promise<SessionDetail> {
+  return readJson<SessionDetail>(`${BASE}/sessions/${encodeURIComponent(runId)}`);
 }

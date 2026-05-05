@@ -268,6 +268,7 @@ class JenkinsClient:
         max_error_regions_per_stage: int = 15,
         min_anchor_score_for_snippet: int = 2,
         parallel_stage_overlap_ms: int = 2000,
+        parallel_block_edge_scan_ids: int = 8,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.failed_rss_path = failed_rss_path
@@ -279,6 +280,7 @@ class JenkinsClient:
         self.max_error_regions_per_stage = max_error_regions_per_stage
         self.min_anchor_score_for_snippet = min_anchor_score_for_snippet
         self.parallel_stage_overlap_ms = parallel_stage_overlap_ms
+        self.parallel_block_edge_scan_ids = parallel_block_edge_scan_ids
         self.client = httpx.Client(
             auth=(user, api_token),
             timeout=timeout_seconds,
@@ -383,7 +385,9 @@ class JenkinsClient:
                 response.status_code,
             )
 
-        root_failures = self._select_root_failure_stages(stages)
+        root_failures = self._select_root_failure_stages(
+            job_full_name, build_number, stages,
+        )
         if root_failures:
             failed: list[FailedStage] = []
             console_text: str | None = None
@@ -436,14 +440,32 @@ class JenkinsClient:
             )
         ]
 
-    def _select_root_failure_stages(self, stages: list[dict]) -> list[dict]:
+    def _select_root_failure_stages(
+        self,
+        job_full_name: str,
+        build_number: int,
+        stages: list[dict],
+    ) -> list[dict]:
         """Return only the root-cause failed stages — no sequential cascades.
 
-        Builds execution-overlap groups from *all* stages: consecutive stages
-        (sorted by start time) that begin while any member of the current
-        group is still running are placed in the same group (= parallel
-        siblings).  Returns the failed stages from the earliest group that
-        contains at least one failure.
+        Two-tier grouping:
+
+        1.  **Primary** — :meth:`_group_by_flow_graph_parallel_blocks` walks the
+            integer node ids between consecutive top-level stages looking for
+            Jenkins's own ``Execute in parallel`` boundary markers. Stages
+            bracketed by an unmatched ``: Start`` marker are siblings of the
+            same ``parallel { }`` block, regardless of agent-startup latency
+            or paused time — Jenkins itself put them inside that block in the
+            Pipeline DSL, so this is authoritative.
+        2.  **Backup** — :meth:`_group_by_time_overlap_with_slack` falls back
+            to execution-time overlap with a configurable ``slack_ms`` so
+            small inter-sibling delays don't split a real parallel group on
+            old Jenkins versions or when wfapi probes fail (e.g. network
+            blips, scan-budget exhaustion).
+
+        Returns the failed stages from the **earliest** group that contains
+        at least one failure (typical sequential cascades downstream of a
+        parallel-block failure are correctly excluded).
         """
         if not stages:
             return []
@@ -451,24 +473,13 @@ class JenkinsClient:
         error_statuses = {"FAILED", "ERROR", "ABORTED"}
         ordered = sorted(stages, key=lambda s: int(s.get("startTimeMillis") or 0))
 
-        groups: list[list[dict]] = []
-        cur_group: list[dict] = [ordered[0]]
-        group_end = (
-            int(ordered[0].get("startTimeMillis") or 0)
-            + int(ordered[0].get("durationMillis") or 0)
+        groups = self._group_by_flow_graph_parallel_blocks(
+            job_full_name, build_number, ordered,
         )
-
-        for s in ordered[1:]:
-            s_start = int(s.get("startTimeMillis") or 0)
-            s_end = s_start + int(s.get("durationMillis") or 0)
-            if s_start < group_end:
-                cur_group.append(s)
-                group_end = max(group_end, s_end)
-            else:
-                groups.append(cur_group)
-                cur_group = [s]
-                group_end = s_end
-        groups.append(cur_group)
+        if groups is None:
+            groups = self._group_by_time_overlap_with_slack(
+                ordered, self.parallel_stage_overlap_ms,
+            )
 
         for group in groups:
             failed_in_group = [
@@ -479,6 +490,211 @@ class JenkinsClient:
                 return failed_in_group
 
         return []
+
+    def _group_by_flow_graph_parallel_blocks(
+        self,
+        job_full_name: str,
+        build_number: int,
+        ordered: list[dict],
+    ) -> list[list[dict]] | None:
+        """Authoritative parallel-sibling detection via the wfapi flow graph.
+
+        For each gap between consecutive top-level stages, we probe two
+        small windows of node ids — *not* every id in the gap — looking
+        for Jenkins's own ``Execute in parallel : Start`` / ``: End``
+        markers:
+
+        * **Forward edge** (always): probe up to ``edge`` ids immediately
+          after the previous stage. Real Jenkins emits ``: Start`` here
+          when a parallel block is opening for the next stage.
+        * **Backward edge** (only when a block is open on the stack):
+          probe up to ``edge`` ids immediately before the next stage.
+          ``: End`` reliably lives a few ids before the next sequential
+          stage; if no block is open there's nothing to close, so we
+          skip the scan.
+
+        For your ``cleaning service`` build (13 stages, one parallel
+        block) this drops the worst case from ~150 probes to roughly 80.
+
+        Each ``: Start`` we encounter pushes its node id onto the stack;
+        each matching ``: End`` pops it. A stage's enclosing parallel
+        block is the id at the top of the stack at the moment its row
+        is reached; stages sharing the same id are siblings.
+
+        Returns ``None`` (clean surrender → caller uses the slack
+        backup) when:
+
+        * any wfapi probe errors out (we never group on partial data),
+        * the wfapi payload is malformed (non-numeric / out-of-order
+          ids), or
+        * after processing every stage the ``open_stack`` is non-empty
+          — a marker we should have seen lived outside our edge windows.
+          Better to fall back to a known heuristic than to silently
+          mis-group later stages as members of a "still open" block.
+        """
+        # Cache: int id -> name string (or None on lookup failure).
+        # 404 is a normal outcome — Jenkins skips ids during execution
+        # — so we cache it as an empty name and keep going.
+        name_cache: dict[int, str | None] = {}
+        job_path = self._job_path(job_full_name)
+
+        def fetch_name(nid: int) -> str | None:
+            if nid in name_cache:
+                return name_cache[nid]
+            url = (
+                f"{self.base_url}/{job_path}/{build_number}"
+                f"/execution/node/{nid}/wfapi/describe"
+            )
+            try:
+                resp = self.client.get(url)
+            except Exception:  # noqa: BLE001 — network blip → backup path
+                name_cache[nid] = None
+                return None
+            if resp.status_code == 404:
+                name_cache[nid] = ""
+                return ""
+            if resp.status_code >= 400:
+                name_cache[nid] = None
+                return None
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001
+                name_cache[nid] = None
+                return None
+            name_cache[nid] = str(data.get("name") or "")
+            return name_cache[nid]
+
+        parallel_start = "Execute in parallel : Start"
+        parallel_end = "Execute in parallel : End"
+        edge = max(1, int(self.parallel_block_edge_scan_ids))
+
+        def collect_markers(
+            scan_range: range,
+        ) -> list[tuple[int, str]] | None:
+            """Probe a small window and return (id, kind) markers in order.
+
+            Returns ``None`` if any probe fails — the caller propagates
+            that as a whole-build surrender.
+            """
+            out: list[tuple[int, str]] = []
+            for nid in scan_range:
+                name = fetch_name(nid)
+                if name is None:
+                    return None
+                if name == parallel_start:
+                    out.append((nid, "start"))
+                elif name == parallel_end:
+                    out.append((nid, "end"))
+            return out
+
+        open_stack: list[int] = []
+        enclosing: dict[int, int | None] = {}
+        prev_id = 0
+
+        for stage in ordered:
+            sid = int(stage.get("id") or 0)
+            if sid <= 0 or sid <= prev_id:
+                # Malformed wfapi payload (non-numeric, duplicate, or
+                # inverted ids — which shouldn't happen in real Jenkins).
+                return None
+
+            gap_start = prev_id + 1
+            gap_end = sid  # exclusive
+
+            # Forward edge: up to ``edge`` ids after the previous stage.
+            forward_stop = min(gap_end, gap_start + edge)
+            forward = collect_markers(range(gap_start, forward_stop))
+            if forward is None:
+                return None
+
+            # Backward edge: only when we *might* have a pending End to
+            # close. Skip when nothing's open — there's no End to find.
+            # Also skip when the forward window already covered the
+            # whole gap (small gaps need only one scan).
+            backward: list[tuple[int, str]] = []
+            if open_stack and forward_stop < gap_end:
+                back_start = max(forward_stop, gap_end - edge)
+                got = collect_markers(range(back_start, gap_end))
+                if got is None:
+                    return None
+                backward = got
+
+            # Apply markers in chronological (id) order so nested
+            # blocks stack/pop correctly.
+            for _nid, kind in sorted(forward + backward, key=lambda m: m[0]):
+                if kind == "start":
+                    open_stack.append(_nid)
+                elif kind == "end" and open_stack:
+                    open_stack.pop()
+
+            enclosing[sid] = open_stack[-1] if open_stack else None
+            prev_id = sid
+
+        # Sanity check: every parallel block opened during the build
+        # must have closed by now. If we end with anything on the stack,
+        # an End marker lived outside our edge windows — admit defeat
+        # and let the slack backup take over.
+        if open_stack:
+            logger.info(
+                "%s#%s: parallel-block edge scan ended with %d unmatched "
+                "open block(s); falling back to time-overlap grouping "
+                "(consider raising PARALLEL_BLOCK_EDGE_SCAN_IDS)",
+                job_full_name,
+                build_number,
+                len(open_stack),
+            )
+            return None
+
+        by_block: dict[int, list[dict]] = {}
+        singletons: list[list[dict]] = []
+        for s in ordered:
+            sid = int(s.get("id") or 0)
+            block = enclosing.get(sid)
+            if block is not None:
+                by_block.setdefault(block, []).append(s)
+            else:
+                singletons.append([s])
+
+        groups: list[list[dict]] = list(by_block.values()) + singletons
+        groups.sort(
+            key=lambda g: min(int(s.get("startTimeMillis") or 0) for s in g),
+        )
+        return groups
+
+    @staticmethod
+    def _group_by_time_overlap_with_slack(
+        ordered: list[dict], slack_ms: int,
+    ) -> list[list[dict]]:
+        """Backup: cluster stages whose intervals overlap, plus ``slack_ms`` grace.
+
+        Strict ``s_start < group_end`` (the previous behaviour) splits true
+        parallel siblings whenever an upstream branch finishes faster than
+        the next branch's executor warm-up — a common pattern with shared
+        agents. Adding the configurable slack absorbs that gap; tune via
+        ``PARALLEL_STAGE_OVERLAP_MS``.
+        """
+        if not ordered:
+            return []
+        groups: list[list[dict]] = []
+        cur_group: list[dict] = [ordered[0]]
+        group_end = (
+            int(ordered[0].get("startTimeMillis") or 0)
+            + int(ordered[0].get("durationMillis") or 0)
+        )
+        slack = max(0, int(slack_ms))
+
+        for s in ordered[1:]:
+            s_start = int(s.get("startTimeMillis") or 0)
+            s_end = s_start + int(s.get("durationMillis") or 0)
+            if s_start < group_end + slack:
+                cur_group.append(s)
+                group_end = max(group_end, s_end)
+            else:
+                groups.append(cur_group)
+                cur_group = [s]
+                group_end = s_end
+        groups.append(cur_group)
+        return groups
 
     def _stage_log_excerpt(
         self, job_full_name: str, build_number: int, stage_id: str | None, stage_name: str

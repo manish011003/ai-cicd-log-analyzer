@@ -4,32 +4,19 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 
+from app.ci import create_ci_source
 from app.config import settings
 from app.dispatcher import WorkerDispatcher
-from app.jenkins_client import JenkinsClient
 from app.postgres_state_store import PostgresStateStore
 from app.service import FailureMonitorService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Jenkins Failure Listener", version="1.0.0")
+app = FastAPI(title="CI Failure Listener", version="1.0.0")
 
-jenkins_client = JenkinsClient(
-    base_url=settings.jenkins_base_url,
-    user=settings.jenkins_user,
-    api_token=settings.jenkins_api_token,
-    failed_rss_path=settings.jenkins_failed_rss_path,
-    timeout_seconds=settings.request_timeout_seconds,
-    max_stage_log_chars=settings.max_stage_log_chars,
-    max_stage_scan_lines=settings.max_stage_scan_lines,
-    per_error_context_before=settings.per_error_context_before,
-    per_error_context_after=settings.per_error_context_after,
-    error_anchor_merge_gap_lines=settings.error_anchor_merge_gap_lines,
-    max_error_regions_per_stage=settings.max_error_regions_per_stage,
-    min_anchor_score_for_snippet=settings.min_anchor_score_for_snippet,
-    parallel_stage_overlap_ms=settings.parallel_stage_overlap_ms,
-)
+# Composition root — build collaborators once, inject into the service.
+ci_source = create_ci_source(settings)
 dispatcher = WorkerDispatcher(
     worker_ingest_url=settings.worker_ingest_url,
     worker_ingest_api_key=settings.worker_ingest_api_key,
@@ -38,7 +25,7 @@ dispatcher = WorkerDispatcher(
 )
 state_store = PostgresStateStore(settings.database_url)
 service = FailureMonitorService(
-    jenkins_client=jenkins_client,
+    ci_source=ci_source,
     dispatcher=dispatcher,
     state_store=state_store,
 )
@@ -46,7 +33,7 @@ service = FailureMonitorService(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "ci_provider": settings.ci_provider}
 
 
 def _safe_http_error_body(exc: httpx.HTTPStatusError) -> str:

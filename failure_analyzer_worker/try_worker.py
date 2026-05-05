@@ -14,8 +14,10 @@ Usage (from repo root)::
     python failure_analyzer_worker/try_worker.py --json path/to/log.txt     # raw JSON dump
 
 Requirements:
-    GROQ_API_KEY in failure_analyzer_worker/.env   (skip with --no-llm or --filter-only)
-    Elasticsearch reachable at ELASTICSEARCH_URL  (optional; ES failures degrade gracefully to no matches)
+    LLM_API_KEY (or legacy GROQ_API_KEY) in failure_analyzer_worker/.env
+        (skip with --no-llm or --filter-only)
+    Elasticsearch reachable at ELASTICSEARCH_URL
+        (optional; failures degrade gracefully to no matches)
 """
 
 from __future__ import annotations
@@ -124,16 +126,18 @@ def main() -> None:
     }
 
     if not args.no_llm:
-        if not log_processor.settings.groq_api_key:
+        s = log_processor.settings
+        if not (s.llm_api_key or s.groq_api_key):
             sys.stderr.write(
-                "error: GROQ_API_KEY is empty. Set it in failure_analyzer_worker/.env, "
-                "or rerun with --no-llm / --filter-only.\n",
+                f"error: no API key set for LLM_PROVIDER={s.llm_provider!r}. "
+                "Set LLM_API_KEY (or legacy GROQ_API_KEY for groq) in "
+                "failure_analyzer_worker/.env, or rerun with --no-llm / --filter-only.\n",
             )
             sys.exit(2)
 
-        from failure_analyzer_worker.graph import analysis_graph
+        from failure_analyzer_worker.graph import get_default_graph
 
-        result = analysis_graph.invoke({
+        result = get_default_graph().invoke({
             "raw_logs": raw,
             "stage_name": args.stage,
             "job_name": args.job,

@@ -1,0 +1,36 @@
+# Top-level (loose) requirements for the worker. Compile with pip-tools to
+# regenerate ``requirements.txt`` with a fully pinned dependency graph:
+#
+#     pip install pip-tools
+#     pip-compile failure_analyzer_worker/requirements.in \
+#         --output-file failure_analyzer_worker/requirements.txt \
+#         --generate-hashes
+#
+# Keep this file as the *source of truth* for what packages we depend on;
+# edit ``requirements.txt`` only through pip-compile.
+
+# Core HTTP / API ------------------------------------------------------------
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+python-dotenv>=1.0,<2.0
+httpx>=0.27,<1.0
+
+# Orchestration --------------------------------------------------------------
+langgraph>=0.2,<1.0
+langchain-core>=0.3,<1.0
+
+# LLM providers (only the active one must actually import) --------------------
+langchain-groq>=0.2,<1.0
+# Uncomment the provider(s) you plan to use:
+# langchain-openai>=0.2,<1.0
+# langchain-anthropic>=0.2,<1.0
+# langchain-ollama>=0.2,<1.0
+# openai>=1.40,<2.0                # needed only for EMBEDDING_PROVIDER=openai
+
+# Embeddings (default provider) ----------------------------------------------
+sentence-transformers>=3.0,<4.0
+
+# Vector store (default provider) --------------------------------------------
+elasticsearch>=8.0,<9.0

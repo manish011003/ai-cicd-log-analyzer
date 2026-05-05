@@ -1,9 +1,9 @@
 import logging
 import time
 
+from app.ci import create_ci_source
 from app.config import settings
 from app.dispatcher import WorkerDispatcher
-from app.jenkins_client import JenkinsClient
 from app.postgres_state_store import PostgresStateStore
 from app.service import FailureMonitorService
 
@@ -12,21 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    jenkins_client = JenkinsClient(
-        base_url=settings.jenkins_base_url,
-        user=settings.jenkins_user,
-        api_token=settings.jenkins_api_token,
-        failed_rss_path=settings.jenkins_failed_rss_path,
-        timeout_seconds=settings.request_timeout_seconds,
-        max_stage_log_chars=settings.max_stage_log_chars,
-        max_stage_scan_lines=settings.max_stage_scan_lines,
-        per_error_context_before=settings.per_error_context_before,
-        per_error_context_after=settings.per_error_context_after,
-        error_anchor_merge_gap_lines=settings.error_anchor_merge_gap_lines,
-        max_error_regions_per_stage=settings.max_error_regions_per_stage,
-        min_anchor_score_for_snippet=settings.min_anchor_score_for_snippet,
-        parallel_stage_overlap_ms=settings.parallel_stage_overlap_ms,
-    )
+    ci_source = create_ci_source(settings)
     dispatcher = WorkerDispatcher(
         worker_ingest_url=settings.worker_ingest_url,
         worker_ingest_api_key=settings.worker_ingest_api_key,
@@ -35,12 +21,16 @@ def main() -> None:
     )
     state_store = PostgresStateStore(settings.database_url)
     service = FailureMonitorService(
-        jenkins_client=jenkins_client,
+        ci_source=ci_source,
         dispatcher=dispatcher,
         state_store=state_store,
     )
 
-    logger.info("Starting Jenkins failure monitor. Poll interval=%ss", settings.poll_interval_seconds)
+    logger.info(
+        "Starting CI failure monitor. provider=%s poll_interval=%ss",
+        settings.ci_provider,
+        settings.poll_interval_seconds,
+    )
     while True:
         try:
             result = service.poll_once()
