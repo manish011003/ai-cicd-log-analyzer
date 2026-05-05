@@ -51,6 +51,7 @@ services:
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
+      - xpack.monitoring.collection.enabled=false
       - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
       - "${ELASTICSEARCH_PUBLISH_PORT:-9200}:9200"
@@ -72,6 +73,8 @@ services:
       - "${KIBANA_PUBLISH_PORT:-5601}:5601"
     environment:
       ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      XPACK_MONITORING_ENABLED: "false"
+      XPACK_MONITORING_UI_ENABLED: "false"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -87,16 +90,33 @@ services:
       WORKER_HOST: 0.0.0.0
       WORKER_PORT: "8090"
       WORKER_API_KEY: ${WORKER_API_KEY:-replace-me}
+      # LLM provider + generic connection ------------------------------------
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      # Set LLM_TLS_VERIFY=0 in .env only behind a corporate MITM proxy with a
+      # self-signed root CA.
+      LLM_TLS_VERIFY: ${LLM_TLS_VERIFY:-1}
+      # Embedder ------------------------------------------------------------
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-sentence_transformers}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-0}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      # Vector store --------------------------------------------------------
+      VECTOR_STORE_PROVIDER: ${VECTOR_STORE_PROVIDER:-elasticsearch}
       ELASTICSEARCH_URL: http://elasticsearch:9200
       ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX:-failure_solutions}
-      ELASTICSEARCH_CONTEXT_INDEX: ${ELASTICSEARCH_CONTEXT_INDEX:-failure_context}
       ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
-      # Set LLM_TLS_VERIFY=0 in .env to disable TLS cert checking on Groq calls
-      # (only needed behind a corporate MITM proxy with a self-signed root CA).
-      LLM_TLS_VERIFY: ${LLM_TLS_VERIFY:-1}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      # Log caps (raw_logs persisted + chat log excerpt sent to LLM) -------
+      RAW_LOG_MAX_CHARS: ${RAW_LOG_MAX_CHARS:-200000}
+      CHAT_LOG_EXCERPT_MAX_CHARS: ${CHAT_LOG_EXCERPT_MAX_CHARS:-12000}
+      CHAT_LOG_EXCERPT_MAX_CHARS_FULL: ${CHAT_LOG_EXCERPT_MAX_CHARS_FULL:-60000}
+      # Prompt overrides (bind-mount a folder and set PROMPTS_DIR to use it)
+      PROMPTS_DIR: ${PROMPTS_DIR:-}
+      # Web UI session hook -------------------------------------------------
       WEB_UI_API_URL: http://web-backend:8095
       WEB_UI_PUBLIC_URL: ${WEB_UI_PUBLIC_URL:-http://localhost:3080}
     ports:
@@ -116,6 +136,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jenkins_listener
+      CI_PROVIDER: ${CI_PROVIDER:-jenkins}
       JENKINS_BASE_URL: ${JENKINS_BASE_URL:-http://host.docker.internal:8080}
       JENKINS_USER: ${JENKINS_USER:-changeme}
       JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-changeme}
@@ -146,6 +167,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jenkins_listener
+      CI_PROVIDER: ${CI_PROVIDER:-jenkins}
       JENKINS_BASE_URL: ${JENKINS_BASE_URL:-http://host.docker.internal:8080}
       JENKINS_USER: ${JENKINS_USER:-changeme}
       JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-changeme}
@@ -176,6 +198,9 @@ services:
       WORKER_API_KEY: ${WORKER_API_KEY:-replace-me}
       LISTENER_BASE_URL: http://listener:8088
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      SESSION_RETENTION_DAYS: ${SESSION_RETENTION_DAYS:-180}
+      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-90}
+      RETENTION_RUN_INTERVAL_HOURS: ${RETENTION_RUN_INTERVAL_HOURS:-24}
     ports:
       - "${WEB_BACKEND_PUBLISH_PORT:-8095}:8095"
     depends_on:

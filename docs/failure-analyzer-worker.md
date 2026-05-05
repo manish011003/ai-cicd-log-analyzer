@@ -19,9 +19,10 @@ in Elasticsearch for future kNN retrieval.
    - and a `recommendation` (`fresh_analysis` vs reuse a known fix).
 5. POSTs a “session” to the web-backend so the UI gets a stable deep-link
    per analysis (`http://<ui>/?session=<uuid>`).
-6. On accepted solutions, exposes `POST /store-solution` and
-   `POST /store-context` so the dashboard can persist verified fixes back
-   into Elasticsearch.
+6. On accepted solutions, exposes `POST /store-solution` so the dashboard
+   can persist verified fixes back into Elasticsearch (the fingerprint is
+   the retrieval key, so we intentionally do not persist the raw log
+   excerpt in ES — raw logs live in Postgres with their session).
 
 ## Logic flow
 
@@ -53,7 +54,6 @@ return { results: [...] }             ──► back to listener for logging
 | ------ | ------------------- | ---------------------------------------------------------------- |
 | POST   | `/ingest/failure`   | Single event or `{"failures": [...]}` batch from the listener    |
 | POST   | `/store-solution`   | Persist an accepted fix into Elasticsearch (kNN training data)   |
-| POST   | `/store-context`    | Persist the filtered excerpt into the secondary context index    |
 | POST   | `/chat/turn`        | One conversational turn for the in-UI assistant                  |
 | GET    | `/health`           | Liveness probe — returns models / index info                     |
 

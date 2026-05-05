@@ -26,14 +26,45 @@ export interface ResultsResponse {
 }
 
 export interface ChatMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
   sources?: { ci_logs: number; analyses: number; solutions: number };
+  // True when this bubble is a derived summary (analysis / suggested fix),
+  // not a real entry in session_messages.
+  seed?: boolean;
 }
 
 export interface ChatResponse {
   answer: string;
   sources: { ci_logs: number; analyses: number; solutions: number };
+}
+
+export interface SessionSummary {
+  id: string;
+  job_full_name: string;
+  build_number: number;
+  stage_name: string;
+  fingerprint: string;
+  analysis: string;
+  suggested_fix: string;
+  filtered_logs: string;
+  matched_solution: string;
+  recommendation: string;
+  feedback_status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SessionMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+}
+
+export interface SessionDetail {
+  session: SessionSummary;
+  messages: SessionMessage[];
 }
 
 export interface ListenerPollPayload {

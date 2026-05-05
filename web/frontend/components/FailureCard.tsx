@@ -117,23 +117,35 @@ export default function FailureCard({ stage, onFeedbackSaved }: Props) {
         </pre>
       )}
 
-      <div className="flex gap-2">
+      <div className="flex items-center gap-2">
+        {/* A session that has already been Accepted/Rejected is locked: clicking
+         * again would have duplicated the kNN entry in Elasticsearch (and now
+         * generates a 409-equivalent idempotent reply from the backend). The
+         * disabled state avoids that round-trip entirely.
+         */}
         <button
           type="button"
-          disabled={saving !== null}
+          disabled={saving !== null || feedback === "accepted" || feedback === "rejected"}
           onClick={() => void handleFeedback("accept")}
-          className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50"
+          className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+          title={feedback === "accepted" ? "Already accepted — solution stored" : feedback === "rejected" ? "Already rejected" : ""}
         >
-          {saving === "accept" ? "Saving..." : "Accept"}
+          {saving === "accept" ? "Saving..." : feedback === "accepted" ? "Accepted" : "Accept"}
         </button>
         <button
           type="button"
-          disabled={saving !== null}
+          disabled={saving !== null || feedback === "accepted" || feedback === "rejected"}
           onClick={() => void handleFeedback("reject")}
-          className="rounded-lg bg-rose-700 px-3 py-2 text-xs font-medium text-white hover:bg-rose-600 disabled:opacity-50"
+          className="rounded-lg bg-rose-700 px-3 py-2 text-xs font-medium text-white hover:bg-rose-600 disabled:cursor-not-allowed disabled:opacity-50"
+          title={feedback === "accepted" ? "Already accepted" : feedback === "rejected" ? "Already rejected" : ""}
         >
-          {saving === "reject" ? "Saving..." : "Reject"}
+          {saving === "reject" ? "Saving..." : feedback === "rejected" ? "Rejected" : "Reject"}
         </button>
+        {(feedback === "accepted" || feedback === "rejected") && (
+          <span className={`text-[11px] ${feedback === "accepted" ? "text-emerald-700 dark:text-emerald-300" : "text-rose-700 dark:text-rose-300"}`}>
+            Decision locked. Reset feedback in the database to change it.
+          </span>
+        )}
       </div>
     </article>
   );

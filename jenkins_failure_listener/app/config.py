@@ -15,6 +15,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # CI source selection — swap provider by changing this one env var once
+    # additional adapters land under ``app/ci/providers/``.
+    ci_provider: str = Field(default="jenkins", alias="CI_PROVIDER")
+
     jenkins_base_url: str = Field(alias="JENKINS_BASE_URL")
     jenkins_user: str = Field(alias="JENKINS_USER")
     jenkins_api_token: str = Field(alias="JENKINS_API_TOKEN")
@@ -36,6 +40,17 @@ class Settings(BaseSettings):
     max_error_regions_per_stage: int = Field(default=15, alias="MAX_ERROR_REGIONS_PER_STAGE")
     min_anchor_score_for_snippet: int = Field(default=2, alias="MIN_ANCHOR_SCORE_FOR_SNIPPET")
     parallel_stage_overlap_ms: int = Field(default=2000, alias="PARALLEL_STAGE_OVERLAP_MS")
+    # How many wfapi node ids we probe at each *edge* of the gap between
+    # consecutive top-level stages when detecting Jenkins's own
+    # ``Execute in parallel : Start`` / ``: End`` markers. Forward edge
+    # scans run from the previous stage; backward scans run only when an
+    # open parallel block is on the stack and look immediately before the
+    # next stage. Real Jenkins emits both markers within a handful of ids
+    # of the surrounding stages, so 8 covers the common case while
+    # bounding HTTP cost. Each probe = one wfapi call.
+    parallel_block_edge_scan_ids: int = Field(
+        default=8, alias="PARALLEL_BLOCK_EDGE_SCAN_IDS",
+    )
     request_timeout_seconds: int = Field(default=30, alias="REQUEST_TIMEOUT_SECONDS")
 
 

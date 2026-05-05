@@ -1,60 +1,36 @@
-"""FastAPI worker: ingest Jenkins failures, run LangGraph analysis, optional ES solution store.
+"""FastAPI worker: ingest Jenkins failures, run the analysis graph, optionally store solutions.
 
-Listener posts to ``POST /ingest/failure``; set ``WORKER_INGEST_URL`` and matching API keys
-in listener and worker ``.env`` files. Routes: ``/ingest/failure``, ``/store-solution``, ``/store-context``, ``/chat/turn``, ``/health``.
+Wiring model:
+
+  FastAPI lifespan → :func:`failure_analyzer_worker.deps.build_deps` → ``app.state.deps``
+                   → :func:`failure_analyzer_worker.graph.build_graph`  → ``app.state.graph``
+
+Routes pull their collaborators from ``request.app.state`` via the small
+``_deps`` / ``_graph`` helpers below. Nothing is a module-level singleton,
+so tests can override any provider by assigning directly to ``app.state``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import log_processor
 from .config import settings
-from .graph import analysis_graph, chat_clarification_reply
+from .deps import Deps, build_deps
+from .graph import AnalysisGraph, build_graph
+from .vectorstore.base import Solution
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    logger.info(
-        "Worker starting  port=%s  api_key_set=%s",
-        settings.worker_port,
-        bool(settings.worker_api_key),
-    )
-    logger.info(
-        "Expecting events from jenkins_failure_listener "
-        "(listener WORKER_INGEST_URL should be "
-        "http://%s:%s/ingest/failure)",
-        settings.worker_host,
-        settings.worker_port,
-    )
-    try:
-        log_processor.reset_es_client()
-        log_processor.ensure_index()
-        log_processor.ensure_context_index()
-        log_processor.prune_stale_documents()
-        logger.info(
-            "ES index ready: %s  url=%s",
-            settings.elasticsearch_index,
-            settings.elasticsearch_url,
-        )
-    except Exception:
-        logger.warning(
-            "ES index creation skipped (ES may not be reachable yet)",
-            exc_info=True,
-        )
-    yield
-
-
-app = FastAPI(title="Failure Analyzer Worker", lifespan=lifespan)
+# ── Request/response models ──────────────────────────────────────────────────
 
 
 class FailedStagePayload(BaseModel):
@@ -83,11 +59,10 @@ class StoreSolutionRequest(BaseModel):
     stage_name: str = ""
     build_number: int = 0
     solution_score: float = 1.0
-
-
-class StoreContextRequest(BaseModel):
-    fingerprint: str
-    filtered_excerpt: str
+    # Optional Postgres session id — if present, becomes the deterministic ES
+    # doc id so re-storing the same accepted session overwrites instead of
+    # creating a duplicate kNN entry.
+    session_id: str = ""
 
 
 class ChatTurnRequest(BaseModel):
@@ -99,11 +74,74 @@ class ChatTurnRequest(BaseModel):
     build_number: int = 0
     analysis: str = ""
     suggested_fix: str = ""
+    # Switch between the compact filtered excerpt (default) and a larger
+    # cap so the LLM sees more raw context on demand. The caller is
+    # responsible for putting the *right* text in ``log_excerpt`` — the
+    # worker only controls truncation.
+    use_full_log: bool = False
+
+
+# ── Lifespan / composition root ──────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "Worker starting  port=%s  api_key_set=%s  llm_provider=%s  vector_store=%s",
+        settings.worker_port,
+        bool(settings.worker_api_key),
+        settings.llm_provider,
+        settings.vector_store_provider,
+    )
+    logger.info(
+        "Expecting events from jenkins_failure_listener "
+        "(listener WORKER_INGEST_URL should be http://%s:%s/ingest/failure)",
+        settings.worker_host,
+        settings.worker_port,
+    )
+
+    deps: Deps = build_deps(settings)
+    graph: AnalysisGraph = build_graph(deps)
+    app.state.deps = deps
+    app.state.graph = graph
+
+    try:
+        deps.solutions.ensure_ready()
+        deps.solutions.prune(settings.elasticsearch_retention_solutions_days)
+        logger.info(
+            "Solution repo ready  provider=%s  url=%s  index=%s",
+            settings.vector_store_provider,
+            settings.elasticsearch_url,
+            settings.elasticsearch_index,
+        )
+    except Exception:
+        logger.warning(
+            "Vector store readiness skipped (backend may not be reachable yet)",
+            exc_info=True,
+        )
+    yield
+
+
+app = FastAPI(title="Failure Analyzer Worker", lifespan=lifespan)
+
+
+def _deps(request: Request) -> Deps:
+    return request.app.state.deps  # type: ignore[no-any-return]
+
+
+def _graph(request: Request) -> AnalysisGraph:
+    return request.app.state.graph  # type: ignore[no-any-return]
+
+
+# ── Security ─────────────────────────────────────────────────────────────────
 
 
 def _verify_api_key(key: str) -> None:
     if settings.worker_api_key and key != settings.worker_api_key:
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# ── Web UI session hook ──────────────────────────────────────────────────────
 
 
 def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
@@ -112,7 +150,8 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
         return
     pub = (settings.web_ui_public_url or "").strip().rstrip("/") or "http://127.0.0.1:3000"
     post_url = f"{base}/api/sessions"
-    with httpx.Client(timeout=20.0) as client:
+    timeout = settings.web_ui_session_timeout_seconds
+    with httpx.Client(timeout=timeout) as client:
         for row in rows:
             body = {
                 "job_full_name": row.get("job_name") or "",
@@ -123,6 +162,7 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
                 "analysis": row.get("analysis") or "",
                 "suggested_fix": row.get("suggested_fix") or "",
                 "filtered_logs": row.get("filtered_logs") or "",
+                "raw_logs": row.get("raw_logs") or "",
                 "matched_solution": row.get("matched_solution") or "",
                 "match_score": float(row.get("match_score") or 0),
                 "recommendation": row.get("recommendation") or "",
@@ -141,9 +181,13 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
                 logger.warning("Web UI session hook failed", exc_info=True)
 
 
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+
 @app.post("/ingest/failure")
 def ingest_failure(
     body: dict[str, Any],
+    request: Request,
     x_api_key: str = Header(default=""),
 ) -> dict[str, Any]:
     """One event or ``{"failures": [...]}`` batch from the listener."""
@@ -160,6 +204,7 @@ def ingest_failure(
         [(e.job_full_name, e.build_number, len(e.failed_stages)) for e in events],
     )
 
+    graph = _graph(request)
     all_results: list[dict[str, Any]] = []
 
     for event in events:
@@ -175,7 +220,7 @@ def ingest_failure(
                 len(stage.log_excerpt),
             )
 
-            state = analysis_graph.invoke({
+            state = graph.invoke({
                 "raw_logs": stage.log_excerpt,
                 "stage_name": stage.stage_name,
                 "job_name": event.job_full_name,
@@ -184,6 +229,11 @@ def ingest_failure(
             })
 
             similar = state.get("es_matches") or []
+            # Cap raw_logs so we don't blow up Postgres rows on pathological
+            # builds (10MB+ logs). The listener already crops to ~50KB, but we
+            # hard-stop here regardless.
+            raw_cap = settings.raw_log_max_chars
+            raw_logs = stage.log_excerpt[:raw_cap] if raw_cap > 0 else stage.log_excerpt
             all_results.append({
                 "job_name": event.job_full_name,
                 "build_number": event.build_number,
@@ -192,6 +242,7 @@ def ingest_failure(
                 "stage_name": stage.stage_name,
                 "fingerprint": state.get("fingerprint", ""),
                 "filtered_logs": state.get("filtered_logs", ""),
+                "raw_logs": raw_logs,
                 "analysis": state.get("analysis", ""),
                 "suggested_fix": state.get("suggested_fix", ""),
                 "recommendation": state.get("recommendation", ""),
@@ -215,51 +266,66 @@ def ingest_failure(
 @app.post("/store-solution")
 def store_solution(
     req: StoreSolutionRequest,
+    request: Request,
     x_api_key: str = Header(default=""),
 ) -> dict[str, Any]:
-    """Persist a verified solution to Elasticsearch."""
+    """Persist a verified solution via the configured vector store.
+
+    Idempotency: when ``session_id`` is supplied, we use it (lowercased) as
+    the ES doc id. ES's ``index`` API treats this as upsert-by-id, so a
+    second Accept for the same session overwrites the existing kNN entry
+    instead of creating a duplicate. When no session_id is supplied we
+    fall back to a content hash of (job, stage, build, fingerprint) so even
+    legacy callers get dedup.
+    """
     _verify_api_key(x_api_key)
+    deps = _deps(request)
     try:
-        log_processor.ensure_index()
-        doc_id = log_processor.store_solution(
-            fingerprint=req.fingerprint,
-            solution=req.solution,
-            job_name=req.job_name,
-            stage_name=req.stage_name,
-            build_number=req.build_number,
-            solution_score=req.solution_score,
+        deps.solutions.ensure_ready()
+        doc_id = deps.solutions.store(
+            Solution(
+                fingerprint_text=req.fingerprint,
+                solution=req.solution,
+                job_name=req.job_name,
+                stage_name=req.stage_name,
+                build_number=req.build_number,
+                solution_score=req.solution_score,
+            ),
+            doc_id=_solution_doc_id(req),
         )
     except Exception as exc:
         logger.exception("store_solution failed")
-        raise HTTPException(status_code=500, detail=f"ES store failed: {str(exc)[:300]}")
+        raise HTTPException(
+            status_code=500, detail=f"vector store store failed: {str(exc)[:300]}",
+        ) from exc
     return {"status": "stored", "doc_id": doc_id}
 
 
-@app.post("/store-context")
-def store_context(
-    req: StoreContextRequest,
-    x_api_key: str = Header(default=""),
-) -> dict[str, Any]:
-    _verify_api_key(x_api_key)
-    try:
-        doc_id = log_processor.store_filtered_context(
-            req.fingerprint,
-            req.filtered_excerpt,
-        )
-    except Exception as exc:
-        logger.exception("store_context failed")
-        raise HTTPException(status_code=500, detail=f"ES store failed: {str(exc)[:300]}")
-    return {"status": "stored", "doc_id": doc_id}
+def _solution_doc_id(req: "StoreSolutionRequest") -> str:
+    """Pick a stable doc id for the kNN store.
+
+    Prefer the Postgres session id (one accepted solution per session row).
+    If absent — e.g. a script calling /store-solution directly — derive a
+    content hash so re-runs of the same script don't pollute the index.
+    """
+    sid = (req.session_id or "").strip().lower()
+    if sid:
+        return sid
+    fingerprint = (req.fingerprint or "").strip()
+    seed = f"{req.job_name}|{req.build_number}|{req.stage_name}|{fingerprint}".lower()
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
 @app.post("/chat/turn")
 def chat_turn(
     req: ChatTurnRequest,
+    request: Request,
     x_api_key: str = Header(default=""),
 ) -> dict[str, Any]:
     _verify_api_key(x_api_key)
+    graph = _graph(request)
     try:
-        text = chat_clarification_reply(
+        text = graph.chat_clarification(
             req.messages,
             fingerprint=req.fingerprint,
             log_excerpt=req.log_excerpt,
@@ -268,16 +334,19 @@ def chat_turn(
             build_number=req.build_number,
             analysis=req.analysis,
             suggested_fix=req.suggested_fix,
+            use_full_log=req.use_full_log,
         )
     except Exception as exc:
-        logger.exception("chat_clarification_reply failed")
+        logger.exception("chat_clarification failed")
         msg = str(exc)
         if "rate_limit" in msg.lower() or "429" in msg:
             raise HTTPException(
                 status_code=429,
                 detail="LLM rate limit reached. Please wait a few minutes and try again.",
-            )
-        raise HTTPException(status_code=500, detail=f"LLM chat turn failed: {msg[:300]}")
+            ) from exc
+        raise HTTPException(
+            status_code=500, detail=f"LLM chat turn failed: {msg[:300]}",
+        ) from exc
     return {"role": "assistant", "content": text}
 
 
@@ -286,12 +355,13 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "listener_link": f"http://{settings.worker_host}:{settings.worker_port}/ingest/failure",
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.llm_model,
+        "embedding_provider": settings.embedding_provider,
+        "embedding_model": settings.embedding_model,
+        "vector_store_provider": settings.vector_store_provider,
         "elasticsearch_url": settings.elasticsearch_url,
         "elasticsearch_index": settings.elasticsearch_index,
-        "elasticsearch_context_index": settings.elasticsearch_context_index,
         "retention_solutions_days": settings.elasticsearch_retention_solutions_days,
-        "retention_context_days": settings.elasticsearch_retention_context_days,
         "web_ui_api_url": settings.web_ui_api_url or None,
-        "llm_model": settings.llm_model,
-        "embedding_model": settings.embedding_model,
     }

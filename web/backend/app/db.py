@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS analysis_sessions (
     analysis TEXT NOT NULL DEFAULT '',
     suggested_fix TEXT NOT NULL DEFAULT '',
     filtered_logs TEXT NOT NULL DEFAULT '',
+    raw_logs TEXT NOT NULL DEFAULT '',
     matched_solution TEXT NOT NULL DEFAULT '',
     match_score DOUBLE PRECISION NOT NULL DEFAULT 0,
     recommendation TEXT NOT NULL DEFAULT '',
@@ -28,6 +29,9 @@ CREATE TABLE IF NOT EXISTS analysis_sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Additive migration: older databases won't have raw_logs.
+ALTER TABLE analysis_sessions ADD COLUMN IF NOT EXISTS raw_logs TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS session_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -39,6 +43,9 @@ CREATE TABLE IF NOT EXISTS session_messages (
 
 CREATE INDEX IF NOT EXISTS idx_session_messages_session
 ON session_messages(session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_sessions_updated_at
+ON analysis_sessions(updated_at);
 """
 
 
@@ -106,6 +113,7 @@ def insert_session(
     match_score: float,
     recommendation: str,
     similar_past: list[Any],
+    raw_logs: str = "",
 ) -> str:
     with connect() as conn:
         with conn.cursor() as cur:
@@ -113,11 +121,11 @@ def insert_session(
                 """
                 INSERT INTO analysis_sessions (
                     job_full_name, build_number, stage_name, build_url,
-                    fingerprint, analysis, suggested_fix, filtered_logs,
+                    fingerprint, analysis, suggested_fix, filtered_logs, raw_logs,
                     matched_solution, match_score, recommendation, similar_past
                 ) VALUES (
                     %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s, %s::jsonb
                 )
                 RETURNING id::text
@@ -131,6 +139,7 @@ def insert_session(
                     analysis,
                     suggested_fix,
                     filtered_logs,
+                    raw_logs,
                     matched_solution,
                     match_score,
                     recommendation,
@@ -217,3 +226,53 @@ def list_feedback_totals() -> list[dict[str, Any]]:
                 """
             )
             return list(cur.fetchall())
+
+
+# ── Retention / janitor ─────────────────────────────────────────────────────
+#
+# Strategy:
+#   * ``purge_old_messages`` deletes *chat turns* past the message TTL, but
+#     keeps the session row so the dashboard can still show the build's
+#     analysis + feedback.
+#   * ``purge_old_sessions`` deletes sessions past the session TTL (which
+#     cascades to any remaining messages). Accepted solutions stay in ES, so
+#     deleting the Postgres session does not lose institutional knowledge.
+
+
+def purge_old_messages(days: int) -> int:
+    if days <= 0:
+        return 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM session_messages
+                WHERE created_at < NOW() - make_interval(days => %s)
+                """,
+                (days,),
+            )
+            return int(cur.rowcount or 0)
+
+
+def purge_old_sessions(days: int) -> int:
+    if days <= 0:
+        return 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM analysis_sessions
+                WHERE updated_at < NOW() - make_interval(days => %s)
+                """,
+                (days,),
+            )
+            return int(cur.rowcount or 0)
+
+
+def run_retention(session_days: int, message_days: int) -> dict[str, int]:
+    msgs_deleted = purge_old_messages(message_days)
+    sessions_deleted = purge_old_sessions(session_days)
+    return {
+        "messages_deleted": msgs_deleted,
+        "sessions_deleted": sessions_deleted,
+    }

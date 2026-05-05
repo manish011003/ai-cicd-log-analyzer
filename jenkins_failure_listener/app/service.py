@@ -1,7 +1,7 @@
 import logging
 
+from app.ci import CISource
 from app.dispatcher import WorkerDispatcher
-from app.jenkins_client import JenkinsClient
 from app.models import FailureEvent
 from app.postgres_state_store import PostgresStateStore
 
@@ -9,20 +9,28 @@ logger = logging.getLogger(__name__)
 
 
 class FailureMonitorService:
+    """Pure polling loop: asks the CI source for new failed builds, records
+    claims in Postgres, forwards events to the worker.
+
+    Accepts *any* :class:`CISource` implementation, so adding GitLab /
+    GitHub Actions support is a matter of writing a new adapter and
+    flipping ``CI_PROVIDER`` in the environment.
+    """
+
     def __init__(
         self,
-        jenkins_client: JenkinsClient,
+        ci_source: CISource,
         dispatcher: WorkerDispatcher,
         state_store: PostgresStateStore,
     ) -> None:
-        self.jenkins_client = jenkins_client
+        self.ci_source = ci_source
         self.dispatcher = dispatcher
         self.state_store = state_store
 
     def poll_once(self) -> dict:
         self.state_store.release_stale_processing(stale_minutes=30)
 
-        all_failed = self.jenkins_client.list_failed_builds_from_rss()
+        all_failed = self.ci_source.list_failed_builds()
 
         jobs_in_feed: set[str] = set()
         for item in all_failed:
@@ -51,7 +59,7 @@ class FailureMonitorService:
 
         preview = [(item["job_full_name"], item["build_number"]) for item in new_failures[:25]]
         logger.info(
-            "Poll rss_total=%d new_after_db_filter=%d preview=%s",
+            "Poll ci_total=%d new_after_db_filter=%d preview=%s",
             len(all_failed),
             len(new_failures),
             preview,
@@ -68,7 +76,7 @@ class FailureMonitorService:
                 continue
 
             try:
-                event = self.jenkins_client.build_failure_event(job, number, build_url)
+                event = self.ci_source.build_failure_event(job, number, build_url)
                 events.append(event)
                 claimed.append((job, number, build_url))
             except Exception as exc:  # noqa: BLE001

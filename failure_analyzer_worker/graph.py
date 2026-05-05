@@ -1,18 +1,26 @@
-"""LangGraph: preprocess (filter + fingerprint + ES knn) → analyze with/without prior match."""
+"""LangGraph analysis pipeline wired to pluggable LLM + vector-store providers.
+
+The state machine is unchanged (preprocess → {analyze_with_context |
+analyze_fresh} → END); what changed is that the nodes no longer import
+Groq, Elasticsearch, or sentence-transformers directly. They receive a
+:class:`~failure_analyzer_worker.deps.Deps` bundle and call the abstract
+:class:`~failure_analyzer_worker.llm.LLMClient` / :class:`~failure_analyzer_worker.vectorstore.SolutionRepository`
+interfaces, so swapping any backend is a config change.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
-import httpx
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
-from . import log_processor
-from .config import settings
+from . import filtering
+from .llm import ChatMessage
+
+if TYPE_CHECKING:
+    from .deps import Deps
 
 logger = logging.getLogger(__name__)
 
@@ -36,114 +44,7 @@ class AnalysisState(TypedDict, total=False):
     match_score: float
 
 
-_SYSTEM_PROMPT = (
-    "You are a senior CI/CD failure analyst. You help developers understand "
-    "and resolve Jenkins build failures. Give concise, actionable answers "
-    "with step-by-step fix instructions. Include exact commands and file "
-    "changes. Keep the total response under 400 words. Always use the exact "
-    "markdown headings the user requests (## Analysis, ## Step-by-Step Fix, "
-    "## Verify). Never mention retrieval, similarity scores, embeddings, or "
-    "whether a past incident \"matched\" the current failure."
-)
-
-_WITH_CONTEXT_TEMPLATE = """\
-A Jenkins build has failed. Below are the filtered error logs and a \
-possibly-related prior incident. The prior incident may or may not apply -- \
-judge from the logs.
-
-**Job:** {job_name} #{build_number}
-**Stage:** {stage_name}
-
-## Filtered Error Logs
-```
-{filtered_logs}
-```
-
-## Possibly-Related Prior Incident
-**Past fingerprint:** {past_fingerprint}
-**Resolution from that incident:**
-{past_solution}
-
-Respond using exactly these markdown headings, in this order:
-
-## Analysis
-A short paragraph explaining what went wrong and why, grounded in the logs \
-above. If the prior incident clearly does NOT match (different exception, \
-different service, different exit code), ignore it and diagnose from the \
-logs alone -- do NOT mention the prior incident, similarity, retrieval, or \
-matching.
-
-## Step-by-Step Fix
-Numbered steps with exact commands or file changes in code blocks. Each step \
-should be clear enough to follow without guessing.
-
-## Verify
-One command or check to confirm the fix worked.
-
-Total response under 400 words."""
-
-_FRESH_TEMPLATE = """\
-A Jenkins build has failed. Below are the filtered error logs.
-
-**Job:** {job_name} #{build_number}
-**Stage:** {stage_name}
-
-## Filtered Error Logs
-```
-{filtered_logs}
-```
-
-Respond using exactly these markdown headings, in this order:
-
-## Analysis
-A short paragraph explaining what went wrong and why, with enough technical \
-context for the developer to understand the issue. Ground your reasoning in \
-the logs above.
-
-## Step-by-Step Fix
-Numbered steps with exact commands or file changes in code blocks. Each step \
-should be clear enough to follow without guessing.
-
-## Verify
-One command or check to confirm the fix worked.
-
-Total response under 400 words."""
-
-
-def preprocess(state: AnalysisState) -> dict:
-    """Filter logs → fingerprint → ES similarity search."""
-    raw = state["raw_logs"]
-    body = log_processor.filter_logs(raw)
-    filtered = log_processor.LogProcessor().format_with_metadata(raw, body)
-    fingerprint = log_processor.generate_fingerprint(body, state["stage_name"])
-    es_matches = log_processor.search_similar_solutions(fingerprint)
-
-    logger.info(
-        "preprocess  job=%s #%d  stage=%s  fp_len=%d  es_hits=%d",
-        state.get("job_name", "?"),
-        state.get("build_number", 0),
-        state.get("stage_name", "?"),
-        len(fingerprint),
-        len(es_matches),
-    )
-    return {
-        "filtered_logs": filtered,
-        "fingerprint": fingerprint,
-        "es_matches": es_matches,
-    }
-
-
-def _route(state: AnalysisState) -> str:
-    """Only use a past solution if it confidently clears the threshold.
-
-    ``search_similar_solutions`` already filters by ``SIMILARITY_THRESHOLD``,
-    so a non-empty ``es_matches`` here means at least one strong neighbour.
-    Re-check defensively in case the search ever returns weaker hits.
-    """
-    matches = state.get("es_matches") or []
-    if matches and float(matches[0].get("score") or 0.0) >= settings.similarity_threshold:
-        return "analyze_with_context"
-    return "analyze_fresh"
+# ── Response post-processing ──────────────────────────────────────────────────
 
 
 def _split_response(content: str) -> tuple[str, str]:
@@ -163,12 +64,11 @@ def _split_response(content: str) -> tuple[str, str]:
 
 
 def _strip_match_status_preamble(text: str) -> str:
-    """Remove LLM boilerplate that announces ES/retrieval match status (not user-facing)."""
+    """Remove LLM boilerplate announcing retrieval / similarity status (not user-facing)."""
     t = (text or "").strip()
     if not t:
         return t
 
-    # Peel off leading paragraph(s) that only describe match mechanics / scores.
     for _ in range(6):
         if "\n\n" in t:
             para, rest = t.split("\n\n", 1)
@@ -193,7 +93,7 @@ def _strip_match_status_preamble(text: str) -> str:
                 re.match(
                     r"(?is)^(?:#+\s*)?(?:\*\*)?\s*exact\s+match\s+found\b",
                     candidate,
-                )
+                ),
             )
         )
 
@@ -205,62 +105,253 @@ def _strip_match_status_preamble(text: str) -> str:
     return t.strip()
 
 
-def _get_llm() -> ChatGroq:
-    # Honor LLM_TLS_VERIFY=0/false to allow corporate proxies with self-signed certs
-    # (defaults to verifying). Never silently disable verification.
-    verify_env = (settings.llm_tls_verify or "").strip().lower()
-    verify: bool = verify_env not in {"0", "false", "no", "off"}
-    if not verify:
-        logger.warning(
-            "LLM_TLS_VERIFY is disabled — Groq TLS certificate will not be checked. "
-            "Use this only behind a trusted MITM proxy.",
+# ── Graph assembly ────────────────────────────────────────────────────────────
+
+
+class AnalysisGraph:
+    """Stateful LangGraph compiled against a specific :class:`Deps` bundle.
+
+    Construct once per worker process (usually in the FastAPI lifespan) and
+    call :meth:`invoke` for each failure event.
+    """
+
+    def __init__(self, deps: "Deps") -> None:
+        self._deps = deps
+        self._graph = self._build()
+
+    # ── public API ──
+
+    def invoke(self, state: AnalysisState | dict) -> dict:
+        return self._graph.invoke(state)
+
+    def chat_clarification(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        fingerprint: str = "",
+        log_excerpt: str = "",
+        job_name: str = "",
+        stage_name: str = "",
+        build_number: int = 0,
+        analysis: str = "",
+        suggested_fix: str = "",
+        use_full_log: bool = False,
+    ) -> str:
+        """Follow-up chat after initial analysis (e.g. user rejected the suggested fix).
+
+        ``use_full_log=True`` signals the caller already fetched the raw log
+        excerpt (stored in Postgres) and wants a larger slice injected into
+        the system prompt. The cap is still bounded by
+        ``settings.chat_log_excerpt_max_chars_full`` so we don't accidentally
+        overflow the LLM context window.
+        """
+        settings = self._deps.settings
+        cap = (
+            settings.chat_log_excerpt_max_chars_full
+            if use_full_log
+            else settings.chat_log_excerpt_max_chars
         )
-    http_client = httpx.Client(verify=verify)
-    return ChatGroq(
-        model=settings.llm_model,
-        temperature=settings.llm_temperature,
-        max_tokens=settings.llm_max_tokens,
-        groq_api_key=settings.groq_api_key,
-        http_client=http_client,
-    )
 
+        ctx_parts: list[str] = []
+        if job_name or build_number:
+            ctx_parts.append(f"Job: {job_name} #{build_number}  stage: {stage_name}")
+        if analysis:
+            ctx_parts.append(f"## Original Analysis\n{analysis}")
+        if suggested_fix:
+            ctx_parts.append(f"## Suggested Fix\n{suggested_fix}")
+        if fingerprint:
+            ctx_parts.append(f"Fingerprint:\n{fingerprint}")
+        if log_excerpt and log_excerpt.strip():
+            label = "Raw log excerpt" if use_full_log else "Filtered log excerpt"
+            ctx_parts.append(f"{label}:\n{log_excerpt[:cap]}")
 
-def analyze_with_context(state: AnalysisState) -> dict:
-    """Ask the LLM to verify whether a retrieved past solution applies."""
-    best = state["es_matches"][0]
-    prompt = _WITH_CONTEXT_TEMPLATE.format(
-        job_name=state.get("job_name", "unknown"),
-        build_number=state.get("build_number", 0),
-        stage_name=state.get("stage_name", "unknown"),
-        filtered_logs=state.get("filtered_logs", ""),
-        past_fingerprint=best.get("fingerprint_text", ""),
-        past_solution=best.get("solution", ""),
-    )
+        ctx = "\n\n".join(ctx_parts)
+        system_prompt = self._deps.prompts.load("clarify_system")
+        sys_content = system_prompt.strip() + ("\n\n" + ctx if ctx else "")
 
-    resp = _get_llm().invoke([
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-    analysis, suggested_fix = _split_response(resp.content)
-    analysis = _strip_match_status_preamble(analysis)
-    if not analysis.strip():
-        analysis = (
-            "The build failed in this stage; the logs point to the issue described "
-            "in the step-by-step fix below."
+        chat_messages: list[ChatMessage] = [ChatMessage(role="system", content=sys_content)]
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role == "assistant":
+                chat_messages.append(ChatMessage(role="assistant", content=content))
+            elif role == "system":
+                chat_messages.append(ChatMessage(role="system", content=content))
+            else:
+                chat_messages.append(ChatMessage(role="user", content=content))
+
+        logger.info(
+            "chat_clarification  msgs=%d  ctx_len=%d", len(messages), len(sys_content),
         )
-    return {
-        "analysis": analysis,
-        "suggested_fix": suggested_fix,
-        "matched_solution": best.get("solution", ""),
-        "match_score": best.get("score", 0.0),
-        "recommendation": "verified_past_solution",
-    }
+        return self._deps.llm.invoke(chat_messages)
+
+    # ── graph construction ──
+
+    def _build(self):
+        builder = StateGraph(AnalysisState)
+        builder.add_node("preprocess", self._preprocess)
+        builder.add_node("analyze_with_context", self._analyze_with_context)
+        builder.add_node("analyze_fresh", self._analyze_fresh)
+
+        builder.set_entry_point("preprocess")
+        builder.add_conditional_edges(
+            "preprocess",
+            self._route,
+            {
+                "analyze_with_context": "analyze_with_context",
+                "analyze_fresh": "analyze_fresh",
+            },
+        )
+        builder.add_edge("analyze_with_context", END)
+        builder.add_edge("analyze_fresh", END)
+        return builder.compile()
+
+    # ── nodes ──
+
+    def _preprocess(self, state: AnalysisState) -> dict:
+        """Filter logs → fingerprint → vector-store similarity search."""
+        raw = state["raw_logs"]
+        body = filtering.filter_logs(raw)
+        filtered = filtering.LogProcessor().format_with_metadata(raw, body)
+        fingerprint = filtering.generate_fingerprint(body, state["stage_name"])
+
+        try:
+            matches = self._deps.solutions.search(fingerprint)
+        except Exception:
+            logger.exception("solution repo search failed")
+            matches = []
+
+        logger.info(
+            "preprocess  job=%s #%d  stage=%s  fp_len=%d  matches=%d",
+            state.get("job_name", "?"),
+            state.get("build_number", 0),
+            state.get("stage_name", "?"),
+            len(fingerprint),
+            len(matches),
+        )
+        return {
+            "filtered_logs": filtered,
+            "fingerprint": fingerprint,
+            # Normalize to plain dicts so downstream state/JSON stays simple.
+            "es_matches": [m.to_dict() if hasattr(m, "to_dict") else m for m in matches],
+        }
+
+    def _route(self, state: AnalysisState) -> str:
+        """Only use a past solution if it confidently clears the threshold.
+
+        ``SolutionRepository.search`` already filters by
+        ``SIMILARITY_THRESHOLD``, so a non-empty list here means at least one
+        strong neighbour. Re-check defensively in case a future backend ever
+        returns weaker hits.
+        """
+        matches = state.get("es_matches") or []
+        threshold = self._deps.settings.similarity_threshold
+        if matches and float(matches[0].get("score") or 0.0) >= threshold:
+            return "analyze_with_context"
+        return "analyze_fresh"
+
+    def _analyze_with_context(self, state: AnalysisState) -> dict:
+        best = state["es_matches"][0]
+        prompt = self._deps.prompts.render(
+            "with_context",
+            job_name=state.get("job_name", "unknown"),
+            build_number=state.get("build_number", 0),
+            stage_name=state.get("stage_name", "unknown"),
+            filtered_logs=state.get("filtered_logs", ""),
+            past_fingerprint=best.get("fingerprint_text", ""),
+            past_solution=best.get("solution", ""),
+        )
+        system = self._deps.prompts.load("system")
+
+        content = self._deps.llm.invoke(
+            [
+                ChatMessage(role="system", content=system),
+                ChatMessage(role="user", content=prompt),
+            ],
+        )
+        analysis, suggested_fix = _split_response(content)
+        analysis = _strip_match_status_preamble(analysis)
+        if not analysis.strip():
+            analysis = (
+                "The build failed in this stage; the logs point to the issue described "
+                "in the step-by-step fix below."
+            )
+        return {
+            "analysis": analysis,
+            "suggested_fix": suggested_fix,
+            "matched_solution": best.get("solution", ""),
+            "match_score": best.get("score", 0.0),
+            "recommendation": "verified_past_solution",
+        }
+
+    def _analyze_fresh(self, state: AnalysisState) -> dict:
+        prompt = self._deps.prompts.render(
+            "fresh",
+            job_name=state.get("job_name", "unknown"),
+            build_number=state.get("build_number", 0),
+            stage_name=state.get("stage_name", "unknown"),
+            filtered_logs=state.get("filtered_logs", ""),
+        )
+        system = self._deps.prompts.load("system")
+
+        content = self._deps.llm.invoke(
+            [
+                ChatMessage(role="system", content=system),
+                ChatMessage(role="user", content=prompt),
+            ],
+        )
+        analysis, suggested_fix = _split_response(content)
+        return {
+            "analysis": analysis,
+            "suggested_fix": suggested_fix,
+            "matched_solution": "",
+            "match_score": 0.0,
+            "recommendation": "fresh_analysis",
+        }
 
 
-CLARIFY_SYSTEM = (
-    "You help refine CI/CD failure analysis. The user may reject or question the suggested fix. "
-    "Ask concise follow-up questions or propose a revised fix. Keep under 350 words."
-)
+# ── Public factory + lazy default graph for backward-compatible callers ──────
+
+
+def build_graph(deps: "Deps") -> AnalysisGraph:
+    """Preferred entry point: build an :class:`AnalysisGraph` for explicit deps."""
+    return AnalysisGraph(deps)
+
+
+_default_graph: AnalysisGraph | None = None
+
+
+def get_default_graph() -> AnalysisGraph:
+    """Lazily build the default graph from module-level ``settings``.
+
+    Preserves the old ``analysis_graph = build_graph()`` import site for
+    CLI helpers (``try_worker.py``) without forcing them to know about DI.
+    The FastAPI worker uses explicit :func:`build_graph` in its lifespan.
+    """
+    global _default_graph
+    if _default_graph is None:
+        from .config import settings
+        from .deps import build_deps
+
+        _default_graph = build_graph(build_deps(settings))
+    return _default_graph
+
+
+def reset_default_graph() -> None:
+    """Drop the cached default graph (tests + post-config reloads)."""
+    global _default_graph
+    _default_graph = None
+
+
+class _DeferredGraph:
+    """Lazy shim so ``from failure_analyzer_worker.graph import analysis_graph``
+    keeps working without building the graph at import time."""
+
+    def invoke(self, state: AnalysisState | dict) -> dict:
+        return get_default_graph().invoke(state)
+
+
+analysis_graph = _DeferredGraph()
 
 
 def chat_clarification_reply(
@@ -273,77 +364,17 @@ def chat_clarification_reply(
     build_number: int = 0,
     analysis: str = "",
     suggested_fix: str = "",
+    use_full_log: bool = False,
 ) -> str:
-    """Follow-up chat after initial analysis (e.g. user rejected the suggested fix)."""
-    ctx_parts: list[str] = []
-    if job_name or build_number:
-        ctx_parts.append(f"Job: {job_name} #{build_number}  stage: {stage_name}")
-    if analysis:
-        ctx_parts.append(f"## Original Analysis\n{analysis}")
-    if suggested_fix:
-        ctx_parts.append(f"## Suggested Fix\n{suggested_fix}")
-    if fingerprint:
-        ctx_parts.append(f"Fingerprint:\n{fingerprint}")
-    if log_excerpt and log_excerpt.strip():
-        ctx_parts.append(f"Filtered log excerpt:\n{log_excerpt[:12000]}")
-    ctx = "\n\n".join(ctx_parts)
-    sys_content = CLARIFY_SYSTEM + ("\n\n" + ctx if ctx else "")
-    lc_messages: list = [SystemMessage(content=sys_content)]
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if role == "assistant":
-            lc_messages.append(AIMessage(content=content))
-        else:
-            lc_messages.append(HumanMessage(content=content))
-
-    logger.info("chat_clarification_reply  msgs=%d  ctx_len=%d", len(messages), len(sys_content))
-    resp = _get_llm().invoke(lc_messages)
-    out = resp.content
-    return out if isinstance(out, str) else str(out)
-
-
-def analyze_fresh(state: AnalysisState) -> dict:
-    """No prior match — ask the LLM to diagnose from scratch."""
-    prompt = _FRESH_TEMPLATE.format(
-        job_name=state.get("job_name", "unknown"),
-        build_number=state.get("build_number", 0),
-        stage_name=state.get("stage_name", "unknown"),
-        filtered_logs=state.get("filtered_logs", ""),
+    """Backward-compat wrapper — delegates to the default graph's chat method."""
+    return get_default_graph().chat_clarification(
+        messages,
+        fingerprint=fingerprint,
+        log_excerpt=log_excerpt,
+        job_name=job_name,
+        stage_name=stage_name,
+        build_number=build_number,
+        analysis=analysis,
+        suggested_fix=suggested_fix,
+        use_full_log=use_full_log,
     )
-
-    resp = _get_llm().invoke([
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-    analysis, suggested_fix = _split_response(resp.content)
-    return {
-        "analysis": analysis,
-        "suggested_fix": suggested_fix,
-        "matched_solution": "",
-        "match_score": 0.0,
-        "recommendation": "fresh_analysis",
-    }
-
-
-def build_graph():
-    builder = StateGraph(AnalysisState)
-
-    builder.add_node("preprocess", preprocess)
-    builder.add_node("analyze_with_context", analyze_with_context)
-    builder.add_node("analyze_fresh", analyze_fresh)
-
-    builder.set_entry_point("preprocess")
-    builder.add_conditional_edges(
-        "preprocess",
-        _route,
-        {"analyze_with_context": "analyze_with_context",
-         "analyze_fresh": "analyze_fresh"},
-    )
-    builder.add_edge("analyze_with_context", END)
-    builder.add_edge("analyze_fresh", END)
-
-    return builder.compile()
-
-
-analysis_graph = build_graph()

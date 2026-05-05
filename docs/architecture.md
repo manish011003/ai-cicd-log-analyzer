@@ -34,7 +34,7 @@ dashboard.
    ┌──────────────────────┐         ┌────────────────────────────────┐
    │   Elasticsearch      │         │  web/backend (FastAPI)          │
    │  failure_solutions   │◀────────│  - sessions, chat, feedback     │
-   │  failure_context     │         │  - proxies /poll-once → listener│
+   │  (accepted fixes)    │         │  - proxies /poll-once → listener│
    └──────────────────────┘         │  - reads/writes Postgres         │
                                     └──────────────┬─────────────────┘
                                                    │ HTTP (JSON)
@@ -50,7 +50,7 @@ dashboard.
 | Store          | Used by                        | What it holds                                                |
 | -------------- | ------------------------------ | ------------------------------------------------------------ |
 | Postgres       | listener + web-backend         | processed-build state, web sessions, chat history, feedback  |
-| Elasticsearch  | worker                         | `failure_solutions` (kNN) + `failure_context` (filtered logs) |
+| Elasticsearch  | worker                         | `failure_solutions` (kNN of accepted fixes)                  |
 
 Both are provisioned automatically by `docker-compose.yml`. Kibana is included
 for ad-hoc inspection of the Elasticsearch indices on `http://localhost:5601`.

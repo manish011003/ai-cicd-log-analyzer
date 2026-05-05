@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -29,10 +30,49 @@ def _json_safe(val: Any) -> Any:
     return val
 
 
+async def _retention_loop() -> None:
+    """Background janitor that purges old sessions + messages on a timer.
+
+    Runs once on startup so long-lived deployments always converge to the
+    configured TTL, even if the schedule never fires (e.g. crashy container).
+    """
+    interval_hours = max(settings.retention_run_interval_hours, 0)
+    while True:
+        try:
+            result = db.run_retention(
+                session_days=settings.session_retention_days,
+                message_days=settings.message_retention_days,
+            )
+            logger.info(
+                "Retention sweep  sessions_deleted=%d  messages_deleted=%d  "
+                "(session_ttl=%dd message_ttl=%dd)",
+                result["sessions_deleted"],
+                result["messages_deleted"],
+                settings.session_retention_days,
+                settings.message_retention_days,
+            )
+        except Exception:
+            logger.exception("Retention sweep failed")
+        if interval_hours <= 0:
+            return
+        await asyncio.sleep(interval_hours * 3600)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_schema()
-    yield
+    task: asyncio.Task[None] | None = None
+    if settings.retention_run_interval_hours > 0:
+        task = asyncio.create_task(_retention_loop(), name="retention-janitor")
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(title="CI Analyzer Web API", lifespan=lifespan)
@@ -57,6 +97,7 @@ class SessionCreate(BaseModel):
     analysis: str = ""
     suggested_fix: str = ""
     filtered_logs: str = ""
+    raw_logs: str = ""
     matched_solution: str = ""
     match_score: float = 0.0
     recommendation: str = ""
@@ -65,6 +106,9 @@ class SessionCreate(BaseModel):
 
 class MessageIn(BaseModel):
     content: str
+    # Opt-in: include the raw (pre-filter) log excerpt in the LLM context.
+    # More tokens / slower, but preserves detail the filter dropped.
+    use_full_log: bool = False
 
 
 class FeedbackIn(BaseModel):
@@ -74,6 +118,7 @@ class FeedbackIn(BaseModel):
 class AgentChatIn(BaseModel):
     message: str
     run_id: str = ""
+    use_full_log: bool = False
 
 
 _ERR_CLASS_PATTERNS = [
@@ -117,6 +162,8 @@ def _to_result_item(row: dict[str, Any]) -> dict[str, Any]:
 def _build_chat_payload(
     row: dict[str, Any] | None,
     payload: list[dict[str, str]],
+    *,
+    use_full_log: bool = False,
 ) -> dict[str, Any]:
     if not row:
         return {
@@ -128,26 +175,41 @@ def _build_chat_payload(
             "build_number": 0,
             "analysis": "",
             "suggested_fix": "",
+            "use_full_log": use_full_log,
         }
+    # When the caller asks for full-log context, pass the raw Jenkins excerpt
+    # we stored at ingest time; otherwise use the compact filtered excerpt so
+    # the LLM call stays cheap by default.
+    excerpt = (
+        row.get("raw_logs")
+        if use_full_log and row.get("raw_logs")
+        else row.get("filtered_logs")
+    ) or ""
     return {
         "messages": payload,
         "fingerprint": row.get("fingerprint") or "",
-        "log_excerpt": row.get("filtered_logs") or "",
+        "log_excerpt": excerpt,
         "job_name": row.get("job_full_name") or "",
         "stage_name": row.get("stage_name") or "",
         "build_number": int(row.get("build_number") or 0),
         "analysis": row.get("analysis") or "",
         "suggested_fix": row.get("suggested_fix") or "",
+        "use_full_log": use_full_log,
     }
 
 
-def _worker_chat(messages: list[dict[str, str]], row: dict[str, Any] | None = None) -> str:
+def _worker_chat(
+    messages: list[dict[str, str]],
+    row: dict[str, Any] | None = None,
+    *,
+    use_full_log: bool = False,
+) -> str:
     url = f"{settings.worker_base_url.rstrip('/')}/chat/turn"
     try:
         r = httpx.post(
             url,
             headers={"X-Api-Key": settings.worker_api_key},
-            json=_build_chat_payload(row, messages),
+            json=_build_chat_payload(row, messages, use_full_log=use_full_log),
             timeout=300.0,
         )
         r.raise_for_status()
@@ -217,6 +279,25 @@ def diagnostics() -> dict[str, Any]:
     }
 
 
+@app.post("/api/maintenance/purge")
+def run_maintenance_purge(
+    session_days: int | None = Query(default=None, ge=1, le=3650),
+    message_days: int | None = Query(default=None, ge=1, le=3650),
+) -> dict[str, Any]:
+    """Run retention immediately. Overrides default TTLs if query params given.
+
+    Intended for admin / ops — e.g. ``curl -X POST /api/maintenance/purge?message_days=30``.
+    """
+    s_days = session_days if session_days is not None else settings.session_retention_days
+    m_days = message_days if message_days is not None else settings.message_retention_days
+    result = db.run_retention(session_days=s_days, message_days=m_days)
+    return {
+        "session_retention_days": s_days,
+        "message_retention_days": m_days,
+        **result,
+    }
+
+
 @app.get("/api/sessions")
 def list_sessions() -> list[dict[str, Any]]:
     rows = db.list_sessions()
@@ -234,6 +315,7 @@ def create_session(body: SessionCreate) -> dict[str, Any]:
         analysis=body.analysis,
         suggested_fix=body.suggested_fix,
         filtered_logs=body.filtered_logs,
+        raw_logs=body.raw_logs,
         matched_solution=body.matched_solution,
         match_score=body.match_score,
         recommendation=body.recommendation,
@@ -263,7 +345,7 @@ def post_message(session_id: str, body: MessageIn) -> dict[str, Any]:
     db.insert_message(session_id, "user", body.content)
     msgs = db.list_messages(session_id)
     payload = [{"role": m["role"], "content": m["content"]} for m in msgs]
-    text = _worker_chat(payload, dict(row))
+    text = _worker_chat(payload, dict(row), use_full_log=body.use_full_log)
     db.insert_message(session_id, "assistant", text)
     return {"role": "assistant", "content": text}
 
@@ -276,6 +358,16 @@ def post_feedback(session_id: str, body: FeedbackIn) -> dict[str, Any]:
     d = body.decision.lower().strip()
     if d not in ("accept", "reject"):
         raise HTTPException(status_code=400, detail="decision must be accept or reject")
+
+    # Idempotency: a session that already has terminal feedback should NEVER
+    # generate another /store-solution write. Without this guard the UI's
+    # "Accept" button (which the user can click multiple times before the
+    # dashboard refresh comes back) created duplicate kNN docs in ES — every
+    # re-click was a fresh ``es.index(...)``. We short-circuit here and
+    # report the existing status so the UI can update without side effects.
+    current = (row.get("feedback_status") or "").strip().lower()
+    if current in ("accepted", "rejected"):
+        return {"status": current, "idempotent": True}
 
     if d == "accept":
         solution = (row["suggested_fix"] or row["analysis"] or "").strip()
@@ -293,6 +385,11 @@ def post_feedback(session_id: str, body: FeedbackIn) -> dict[str, Any]:
                     "stage_name": row["stage_name"] or "",
                     "build_number": int(row["build_number"] or 0),
                     "solution_score": 1.0,
+                    # Tell the worker which Postgres session this is so it can
+                    # build a deterministic ES doc id (defence-in-depth: even
+                    # if some other caller bypasses this idempotency guard,
+                    # the worker won't write a duplicate).
+                    "session_id": session_id,
                 },
                 timeout=120.0,
             )
@@ -393,10 +490,14 @@ def agent_chat(body: AgentChatIn) -> dict[str, Any]:
         db.insert_message(run_id, "user", message)
         msgs = db.list_messages(run_id)
         payload = [{"role": m["role"], "content": m["content"]} for m in msgs]
-        answer = _worker_chat(payload, row)
+        answer = _worker_chat(payload, row, use_full_log=body.use_full_log)
         db.insert_message(run_id, "assistant", answer)
     else:
-        answer = _worker_chat([{"role": "user", "content": message}], None)
+        answer = _worker_chat(
+            [{"role": "user", "content": message}],
+            None,
+            use_full_log=body.use_full_log,
+        )
 
     source_counts = {
         "ci_logs": 1 if row and row.get("filtered_logs") else 0,
