@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from . import filtering
 from .llm import ChatMessage
 
 if TYPE_CHECKING:
@@ -33,7 +32,8 @@ class AnalysisState(TypedDict, total=False):
     build_number: int
     build_url: str
     # --- intermediate ---
-    filtered_logs: str
+    filtered_logs: str  # wire-format: plain string fed into the LLM prompt
+    filter_meta: dict[str, Any]  # structured FilterResult payload (locations, confidence, ...)
     fingerprint: str
     es_matches: list[dict[str, Any]]
     # --- outputs ---
@@ -209,29 +209,44 @@ class AnalysisGraph:
     # ── nodes ──
 
     def _preprocess(self, state: AnalysisState) -> dict:
-        """Filter logs → fingerprint → vector-store similarity search."""
+        """Filter logs → fingerprint → vector-store similarity search.
+
+        Uses the structured :class:`Filter` protocol so the locator,
+        confidence flag, and per-pass observability flow into
+        ``state["filter_meta"]``. ``state["filtered_logs"]`` stays a plain
+        string (the wire format the Web UI persists today).
+        """
         raw = state["raw_logs"]
-        body = filtering.filter_logs(raw)
-        filtered = filtering.LogProcessor().format_with_metadata(raw, body)
-        fingerprint = filtering.generate_fingerprint(body, state["stage_name"])
+        stage_name = state.get("stage_name", "")
+        job_name = state.get("job_name", "")
+
+        result = self._deps.filter.filter(raw, stage_name=stage_name, job_name=job_name)
 
         try:
-            matches = self._deps.solutions.search(fingerprint)
+            matches = self._deps.solutions.search(result.fingerprint)
         except Exception:
             logger.exception("solution repo search failed")
             matches = []
 
         logger.info(
-            "preprocess  job=%s #%d  stage=%s  fp_len=%d  matches=%d",
-            state.get("job_name", "?"),
+            "preprocess  job=%s #%d  stage=%s  confidence=%s  loc=%s  "
+            "raw=%d→body=%d (%d tok)  detectors=%s  matches=%d",
+            job_name or "?",
             state.get("build_number", 0),
-            state.get("stage_name", "?"),
-            len(fingerprint),
+            stage_name or "?",
+            result.confidence,
+            result.primary_location.as_anchor() if result.primary_location else "unknown",
+            result.raw_chars,
+            result.body_chars,
+            result.body_tokens,
+            ",".join(result.metadata.get("activated_detectors", [])) or "none",
             len(matches),
         )
+
         return {
-            "filtered_logs": filtered,
-            "fingerprint": fingerprint,
+            "filtered_logs": result.body,
+            "filter_meta": result.metadata,
+            "fingerprint": result.fingerprint,
             # Normalize to plain dicts so downstream state/JSON stays simple.
             "es_matches": [m.to_dict() if hasattr(m, "to_dict") else m for m in matches],
         }

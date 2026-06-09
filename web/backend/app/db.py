@@ -26,12 +26,18 @@ CREATE TABLE IF NOT EXISTS analysis_sessions (
     recommendation TEXT NOT NULL DEFAULT '',
     similar_past JSONB NOT NULL DEFAULT '[]'::jsonb,
     feedback_status TEXT NOT NULL DEFAULT '',
+    filter_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Additive migration: older databases won't have raw_logs.
 ALTER TABLE analysis_sessions ADD COLUMN IF NOT EXISTS raw_logs TEXT NOT NULL DEFAULT '';
+
+-- Additive migration: structural-filter telemetry (detected stack, confidence,
+-- primary location, collapse stats). New column so older installs upgrade
+-- without manual SQL.
+ALTER TABLE analysis_sessions ADD COLUMN IF NOT EXISTS filter_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS session_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -114,6 +120,7 @@ def insert_session(
     recommendation: str,
     similar_past: list[Any],
     raw_logs: str = "",
+    filter_meta: dict[str, Any] | None = None,
 ) -> str:
     with connect() as conn:
         with conn.cursor() as cur:
@@ -122,11 +129,13 @@ def insert_session(
                 INSERT INTO analysis_sessions (
                     job_full_name, build_number, stage_name, build_url,
                     fingerprint, analysis, suggested_fix, filtered_logs, raw_logs,
-                    matched_solution, match_score, recommendation, similar_past
+                    matched_solution, match_score, recommendation, similar_past,
+                    filter_meta
                 ) VALUES (
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s::jsonb
+                    %s, %s, %s, %s::jsonb,
+                    %s::jsonb
                 )
                 RETURNING id::text
                 """,
@@ -144,6 +153,7 @@ def insert_session(
                     match_score,
                     recommendation,
                     Json(similar_past),
+                    Json(filter_meta or {}),
                 ),
             )
             out = cur.fetchone()
@@ -191,7 +201,7 @@ def list_session_records(
                     """
                     SELECT id, job_full_name, build_number, stage_name, fingerprint,
                            filtered_logs, analysis, suggested_fix, recommendation,
-                           feedback_status, created_at
+                           feedback_status, filter_meta, created_at
                     FROM analysis_sessions
                     WHERE job_full_name ILIKE %s
                     ORDER BY created_at DESC
@@ -204,7 +214,7 @@ def list_session_records(
                     """
                     SELECT id, job_full_name, build_number, stage_name, fingerprint,
                            filtered_logs, analysis, suggested_fix, recommendation,
-                           feedback_status, created_at
+                           feedback_status, filter_meta, created_at
                     FROM analysis_sessions
                     ORDER BY created_at DESC
                     LIMIT %s
@@ -226,6 +236,58 @@ def list_feedback_totals() -> list[dict[str, Any]]:
                 """
             )
             return list(cur.fetchall())
+
+
+# ── Knowledge-graph enrichment ──────────────────────────────────────────────
+#
+# These aggregates let the knowledge map answer questions like:
+#   * "How many sessions have this exact fingerprint been seen?"
+#   * "How often has a stored solution actually been suggested again?"
+# Without joining on free-text the answers would be unreliable, so we key
+# on ``fingerprint`` (deterministic across sessions) and on a "solution was
+# matched" boolean (``recommendation = 'verified_past_solution'``).
+
+
+def fingerprint_session_counts() -> dict[str, int]:
+    """Return ``{fingerprint: total_sessions}`` for every non-empty fingerprint."""
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT fingerprint, COUNT(*) AS total
+                FROM analysis_sessions
+                WHERE fingerprint <> ''
+                GROUP BY fingerprint
+                """
+            )
+            return {str(r["fingerprint"]): int(r["total"]) for r in cur.fetchall()}
+
+
+def reuse_summary() -> dict[str, int]:
+    """High-level counts the dashboard's KB metrics row needs.
+
+    * ``accepted_sessions``      — accepted feedback in Postgres
+    * ``matched_sessions``       — sessions where the recommender returned a
+      stored solution (``recommendation = 'verified_past_solution'``)
+    * ``total_sessions``         — total analysis sessions on file
+    """
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE feedback_status = 'accepted') AS accepted_sessions,
+                    COUNT(*) FILTER (WHERE recommendation = 'verified_past_solution') AS matched_sessions,
+                    COUNT(*) AS total_sessions
+                FROM analysis_sessions
+                """
+            )
+            row = cur.fetchone() or {}
+            return {
+                "accepted_sessions": int(row.get("accepted_sessions") or 0),
+                "matched_sessions": int(row.get("matched_sessions") or 0),
+                "total_sessions": int(row.get("total_sessions") or 0),
+            }
 
 
 # ── Retention / janitor ─────────────────────────────────────────────────────

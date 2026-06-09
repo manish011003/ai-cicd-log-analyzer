@@ -47,6 +47,26 @@ class SolutionMatch:
         }
 
 
+@dataclass
+class SolutionRecord:
+    """Full record returned by :meth:`SolutionRepository.list_all`.
+
+    Carries the persisted embedding so callers (e.g. the knowledge-graph
+    endpoint) can compute similarity edges without re-embedding every
+    fingerprint.
+    """
+
+    doc_id: str
+    fingerprint_text: str
+    solution: str
+    job_name: str = ""
+    stage_name: str = ""
+    build_number: int = 0
+    solution_score: float = 1.0
+    created_at: str = ""
+    vector: list[float] = field(default_factory=list)
+
+
 @runtime_checkable
 class SolutionRepository(Protocol):
     """Persistent store of verified past solutions, keyed by fingerprint embeddings."""
@@ -60,3 +80,7 @@ class SolutionRepository(Protocol):
     ) -> str: ...  # pragma: no cover - protocol
 
     def prune(self, older_than_days: int) -> None: ...  # pragma: no cover - protocol
+
+    def list_all(
+        self, *, limit: int = 2000, include_vectors: bool = False,
+    ) -> list[SolutionRecord]: ...  # pragma: no cover - protocol

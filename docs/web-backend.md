@@ -41,9 +41,19 @@ Browser ──POST /api/sessions/{id}/feedback (decision=accept)
 | GET    | `/api/sessions/{id}`                       | Single-session detail + history               |
 | POST   | `/api/sessions/{id}/chat`                  | Append a user message + LLM reply             |
 | POST   | `/api/sessions/{id}/feedback`              | `{ "decision": "accept" \| "reject" }`        |
+| GET    | `/api/filter-config`                       | Cached proxy of the worker's `/filter-config` (powers the Settings page; 60s TTL) |
 | POST   | `/api/listener/poll-once`                  | Proxy to the listener’s `/poll-once`          |
 
 The full surface area is in `web/backend/app/main.py`.
+
+### Structural-filter telemetry
+
+Sessions carry a `filter_meta` JSONB column (added by an additive
+migration in `db.py`). `POST /api/sessions` accepts the worker's
+`filter_meta` dict and `GET /api/results` returns a trimmed projection
+(confidence, detected stack, primary location, compression stats) so
+the dashboard can render a *Detected* panel on each failure card. See
+[`filtering.md`](filtering.md) for the schema.
 
 ## Environment
 

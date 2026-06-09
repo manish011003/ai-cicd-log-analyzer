@@ -23,7 +23,9 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 from .deps import Deps, build_deps
+from .filtering import describe_filter
 from .graph import AnalysisGraph, build_graph
+from .knowledge_graph import build_knowledge_graph
 from .vectorstore.base import Solution
 
 logging.basicConfig(level=logging.INFO)
@@ -167,6 +169,9 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
                 "match_score": float(row.get("match_score") or 0),
                 "recommendation": row.get("recommendation") or "",
                 "similar_past": row.get("similar_past") or [],
+                # Filter telemetry persists alongside the session so the UI
+                # can show what was detected without re-running the filter.
+                "filter_meta": row.get("filter_meta") or {},
             }
             try:
                 r = client.post(post_url, json=body)
@@ -248,6 +253,12 @@ def ingest_failure(
                 "recommendation": state.get("recommendation", ""),
                 "match_score": state.get("match_score", 0),
                 "matched_solution": state.get("matched_solution", ""),
+                # Structural filter telemetry: detected stack, confidence,
+                # primary location, and Pass 2/3 stats. Forwarded verbatim
+                # to the Web UI so the FailureCard can render the
+                # "Detected" row and the Settings page can show recent
+                # detector activations.
+                "filter_meta": state.get("filter_meta", {}),
                 "similar_past": [
                     {
                         "score": m.get("score", 0.0),
@@ -348,6 +359,81 @@ def chat_turn(
             status_code=500, detail=f"LLM chat turn failed: {msg[:300]}",
         ) from exc
     return {"role": "assistant", "content": text}
+
+
+@app.get("/filter-config")
+def filter_config(
+    request: Request,
+    x_api_key: str = Header(default=""),
+) -> dict[str, Any]:
+    """Return a JSON-safe snapshot of the live log filter configuration.
+
+    Powers the platform's *Settings* page so operators can see exactly
+    which detectors are loaded, what the token/character budgets are, and
+    which knobs are tweakable via ``FILTER_*`` / ``LOG_BODY_*`` env vars.
+
+    Read-only by design: changing values still requires editing ``.env``
+    and restarting the worker. A future PR may add a PATCH that writes
+    through to a runtime override store.
+    """
+    _verify_api_key(x_api_key)
+    deps = _deps(request)
+    return describe_filter(settings, deps.filter)
+
+
+@app.get("/knowledge-graph")
+def knowledge_graph(
+    request: Request,
+    x_api_key: str = Header(default=""),
+    limit: int = 2000,
+    similarity: float = 0.0,
+    max_neighbours: int = 6,
+) -> dict[str, Any]:
+    """Materialise the accepted-solutions corpus as a typed graph.
+
+    Heavy lifting (cosine over the vector matrix, community detection) is
+    pure Python / numpy and runs in well under a second for typical
+    knowledge bases (~100s-1000s of docs). Cap with ``limit`` to bound work
+    on pathological indices.
+
+    The resolved similarity threshold defaults to ``settings.similarity_threshold``
+    (the same cutoff the recommender uses) so the graph and the matcher
+    agree on what "similar" means; pass ``similarity`` > 0 to override.
+    """
+    _verify_api_key(x_api_key)
+    deps = _deps(request)
+    threshold = (
+        max(0.0, min(1.0, similarity))
+        if similarity > 0
+        else float(settings.similarity_threshold)
+    )
+
+    try:
+        deps.solutions.ensure_ready()
+    except Exception:
+        logger.warning("knowledge_graph: ensure_ready failed", exc_info=True)
+
+    try:
+        records = deps.solutions.list_all(limit=limit, include_vectors=True)
+    except Exception as exc:
+        logger.exception("knowledge_graph: list_all failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"vector store list_all failed: {str(exc)[:300]}",
+        ) from exc
+
+    graph = build_knowledge_graph(
+        records,
+        similarity_threshold=threshold,
+        max_neighbours=max(1, min(int(max_neighbours), 25)),
+    )
+    logger.info(
+        "knowledge_graph: built  solutions=%d  similarity_edges=%d  communities=%d",
+        graph["stats"]["total_solutions"],
+        graph["stats"]["total_similarity_edges"],
+        graph["stats"]["communities"],
+    )
+    return graph
 
 
 @app.get("/health")

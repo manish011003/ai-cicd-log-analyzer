@@ -7,8 +7,10 @@ in Elasticsearch for future kNN retrieval.
 ## What it does
 
 1. Accepts one or many `stage_failure` events on `POST /ingest/failure`.
-2. For each failed stage, runs a deterministic log filtering and
-   fingerprinting pipeline (`failure_analyzer_worker/log_processor.py`).
+2. For each failed stage, runs the four-pass structural log filter
+   (`failure_analyzer_worker/filtering/`) with stack-specific detectors
+   for Java, Python, and shell. See [`filtering.md`](filtering.md) for
+   the full reference.
 3. Searches Elasticsearch for the most similar previous failure
    fingerprints (cosine kNN over `all-MiniLM-L6-v2` embeddings).
 4. Invokes a LangGraph state machine
@@ -50,14 +52,20 @@ return { results: [...] }             ──► back to listener for logging
 
 ## Public HTTP API
 
-| Method | Path                | Purpose                                                          |
-| ------ | ------------------- | ---------------------------------------------------------------- |
-| POST   | `/ingest/failure`   | Single event or `{"failures": [...]}` batch from the listener    |
-| POST   | `/store-solution`   | Persist an accepted fix into Elasticsearch (kNN training data)   |
-| POST   | `/chat/turn`        | One conversational turn for the in-UI assistant                  |
-| GET    | `/health`           | Liveness probe — returns models / index info                     |
+| Method | Path                | Purpose                                                              |
+| ------ | ------------------- | -------------------------------------------------------------------- |
+| POST   | `/ingest/failure`   | Single event or `{"failures": [...]}` batch from the listener        |
+| POST   | `/store-solution`   | Persist an accepted fix into Elasticsearch (kNN training data)       |
+| POST   | `/chat/turn`        | One conversational turn for the in-UI assistant                      |
+| GET    | `/filter-config`    | Read-only snapshot of the live structural log filter (see [filtering.md](filtering.md)) |
+| GET    | `/knowledge-graph`  | Materialised knowledge graph of accepted solutions                   |
+| GET    | `/health`           | Liveness probe — returns models / index info                         |
 
-All write endpoints require the `X-API-Key` header to match `WORKER_API_KEY`.
+All endpoints require the `X-API-Key` header to match `WORKER_API_KEY`.
+
+`/ingest/failure` response items include a `filter_meta` field (detected
+stack, confidence, primary location, compression stats) so the
+web-backend can persist it and the UI can render the *Detected* panel.
 
 ## Environment
 

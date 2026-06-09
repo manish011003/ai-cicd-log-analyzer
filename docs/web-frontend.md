@@ -9,11 +9,18 @@ records accept/reject feedback that becomes future training data.
 - Lists every session the worker has produced (newest first).
 - Renders the LangGraph output: filtered logs, suggested fix, similar past
   failures with their kNN scores.
+- Surfaces the structural filter's *Detected* panel on each failure card —
+  confidence badge, activated detector chips, primary file:line anchor,
+  and compression ratio. See [`filtering.md`](filtering.md).
 - Hosts the conversational assistant (`ChatPanel`) — every message round-
   trips through the backend → worker `/chat/turn` endpoint.
 - Lets the user accept or reject the suggested fix; accepting triggers the
   backend to write the solution to Elasticsearch via the worker.
 - Provides a “Refresh / Auto-poll” control that proxies to the listener.
+- Exposes a **Settings** page (`/settings`) that surfaces the live filter
+  configuration: detector inventory, token/character budgets, and the
+  env var that controls each knob. Read-only — changes still require
+  editing `.env` and restarting the worker.
 
 ## Logic flow
 
@@ -25,9 +32,17 @@ app/page.tsx ──fetch──► web-backend GET /api/sessions/<uuid>
         │
         ├─► <Dashboard>           list view + selection
         ├─► <FailureCard>         analysis + suggested fix
+        │       └─► <FilterMetaPanel>   detector chips + confidence + location
         ├─► <ChatPanel>           POST /api/sessions/<id>/chat
         ├─► <StatsBar>            kNN match metadata
         └─► feedback buttons ──► POST /api/sessions/<id>/feedback
+
+/settings
+        │
+        ▼
+app/settings/page.tsx ──fetch──► web-backend GET /api/filter-config
+        │
+        └─► <SettingsPanel>       knobs + detector inventory (read-only)
 ```
 
 ## Environment

@@ -114,10 +114,22 @@ class WorkerSettings(BaseSettings):
     )
 
     # ── Log body cap ──────────────────────────────────────────────────────────
-    # Cap the filtered excerpt sent to the LLM in the *initial* analysis. The
-    # listener already pre-crops raw logs (default ~50KB), and filter_logs
-    # strips noise further; 8000 chars fits well inside any provider's context.
+    # The structural filter (`failure_analyzer_worker.filtering`) budgets in
+    # *tokens* (Pass 4 round-robin selection), and only falls back to the
+    # char cap as a hard ceiling when something pathological slips through.
+    # Approximation: ~4 chars per token works for all common BPE tokenizers.
+    log_body_max_tokens: int = Field(default=1500, alias="LOG_BODY_MAX_TOKENS")
     log_body_max_chars: int = Field(default=8000, alias="LOG_BODY_MAX_CHARS")
+
+    # ── Filter detectors (plug-and-play) ─────────────────────────────────────
+    # "auto"   → load every bundled detector; each detector's own activates_on
+    #            decides whether it runs per log.
+    # "none"   → universal core only; no detectors.
+    # "a,b,c"  → explicit allowlist by detector name (see filtering/detectors/).
+    filter_detectors: str = Field(default="auto", alias="FILTER_DETECTORS")
+    filter_max_active_detectors: int = Field(
+        default=5, alias="FILTER_MAX_ACTIVE_DETECTORS",
+    )
 
     # Cap the raw log excerpt persisted alongside each session. Keep this
     # bounded so Postgres rows don't explode on pathological builds; the

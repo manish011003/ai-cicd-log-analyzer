@@ -8,10 +8,17 @@ A Jenkins build has failed. Below are the filtered error logs.
 {filtered_logs}
 ```
 
+Reading the log block above:
+
+- Lines are prefixed with `L<n>:` where `n` is the original log line index.
+- `... K line(s) elided ...` markers mean structurally redundant content was removed (banners, stack-trace interior, JSON dumps, progress bursts, repeats); do not invent content for those gaps.
+- The `[METADATA]` header lists the filter's own assessment (`Primary Error`, `Location`, `Confidence`).
+- If you see a `[FILTER: LOW CONFIDENCE]` banner, do not assert a single root cause — instead enumerate the most likely candidates and ask for the full log.
+
 Respond using exactly these markdown headings, in this order.
 
 ## Analysis
-A short paragraph (2–4 sentences) explaining what went wrong and why, with enough technical context for the developer to understand the issue. Ground your reasoning in the logs above. No bullet points here.
+A short paragraph (2–4 sentences) explaining what went wrong and why, with enough technical context for the developer to understand the issue. Cite specific log lines using `(L<n>)` so the reviewer can jump to the evidence. No bullet points here.
 
 ## Step-by-Step Fix
 For each step, output a level-3 heading followed by one short paragraph and (when needed) a single fenced code block at the left margin.

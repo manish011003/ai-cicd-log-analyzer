@@ -14,10 +14,15 @@ os.environ.setdefault("WORKER_API_KEY", "test")
 
 from failure_analyzer_worker.config import WorkerSettings  # noqa: E402
 from failure_analyzer_worker.deps import Deps  # noqa: E402
+from failure_analyzer_worker.filtering import create_filter  # noqa: E402
 from failure_analyzer_worker.graph import build_graph  # noqa: E402
 from failure_analyzer_worker.llm import ChatMessage  # noqa: E402
 from failure_analyzer_worker.prompts import PromptLoader  # noqa: E402
-from failure_analyzer_worker.vectorstore.base import Solution, SolutionMatch  # noqa: E402
+from failure_analyzer_worker.vectorstore.base import (  # noqa: E402
+    Solution,
+    SolutionMatch,
+    SolutionRecord,
+)
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -68,14 +73,24 @@ class FakeSolutionRepo:
     def prune(self, older_than_days: int) -> None:
         pass
 
+    def list_all(
+        self, *, limit: int = 2000, include_vectors: bool = False,
+    ) -> list[SolutionRecord]:
+        # The fake doesn't back the matches with full SolutionRecord rows; an
+        # empty list keeps the protocol happy and the analysis-graph tests
+        # unchanged. Knowledge-graph tests build their own SolutionRecords.
+        return []
+
 
 def _build_deps(llm: FakeLLM, repo: FakeSolutionRepo) -> Deps:
+    settings = WorkerSettings()
     return Deps(
-        settings=WorkerSettings(),
+        settings=settings,
         llm=llm,
         embedder=FakeEmbedder(),
         solutions=repo,
         prompts=PromptLoader(),
+        filter=create_filter(settings),
     )
 
 

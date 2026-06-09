@@ -12,7 +12,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from ..base import Solution, SolutionMatch
+from ..base import Solution, SolutionMatch, SolutionRecord
 
 if TYPE_CHECKING:
     from elasticsearch import Elasticsearch
@@ -187,6 +187,75 @@ class ElasticsearchSolutionRepository:
             solution.build_number,
         )
         return resolved_id
+
+    # ── bulk read (knowledge-graph) ──
+
+    def list_all(
+        self, *, limit: int = 2000, include_vectors: bool = False,
+    ) -> list[SolutionRecord]:
+        """Return up to ``limit`` solution docs.
+
+        Used by the knowledge-graph endpoint to materialise the full corpus.
+        ``include_vectors=True`` ships the persisted dense vectors so callers
+        can compute similarity edges client-side without re-embedding every
+        fingerprint.
+        """
+        es = self._es()
+        try:
+            if not es.indices.exists(index=self._index):
+                return []
+        except Exception:
+            logger.exception("ES exists check failed for %s", self._index)
+            return []
+
+        source: list[str] = [
+            "fingerprint_text",
+            "solution",
+            "solution_score",
+            "job_name",
+            "stage_name",
+            "build_number",
+            "created_at",
+        ]
+        if include_vectors:
+            source.append("fingerprint_vector")
+
+        try:
+            resp = es.search(
+                index=self._index,
+                size=max(1, min(int(limit), 10_000)),
+                query={"match_all": {}},
+                sort=[{"created_at": {"order": "desc", "unmapped_type": "date"}}],
+                source=source,
+            )
+        except Exception:
+            logger.exception("ES list_all failed")
+            return []
+
+        out: list[SolutionRecord] = []
+        for h in resp.get("hits", {}).get("hits", []):
+            src = h.get("_source") or {}
+            vec_raw = src.get("fingerprint_vector") if include_vectors else None
+            vec: list[float] = []
+            if vec_raw:
+                try:
+                    vec = [float(x) for x in vec_raw]
+                except (TypeError, ValueError):
+                    vec = []
+            out.append(
+                SolutionRecord(
+                    doc_id=str(h.get("_id") or ""),
+                    fingerprint_text=str(src.get("fingerprint_text", "")),
+                    solution=str(src.get("solution", "")),
+                    job_name=str(src.get("job_name", "")),
+                    stage_name=str(src.get("stage_name", "")),
+                    build_number=int(src.get("build_number") or 0),
+                    solution_score=float(src.get("solution_score") or 1.0),
+                    created_at=str(src.get("created_at", "")),
+                    vector=vec,
+                ),
+            )
+        return out
 
     # ── retention ──
 

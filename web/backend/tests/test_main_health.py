@@ -39,6 +39,7 @@ with patch("app.db.init_schema", lambda: None):
         _build_chat_payload,
         _db_target,
         _extract_error_class,
+        _summarize_filter_meta,
         _to_result_item,
         app,
     )
@@ -135,3 +136,93 @@ def test_build_chat_payload_uses_row_metadata():
     assert out["job_name"] == "team/web"
     assert out["build_number"] == 9
     assert out["log_excerpt"] == "logs"
+
+
+# ── Structural-filter telemetry (powers the dashboard Detected panel) ──────
+
+
+def test_summarize_filter_meta_returns_empty_for_missing_or_legacy_rows():
+    assert _summarize_filter_meta(None) == {}
+    assert _summarize_filter_meta({}) == {}
+    assert _summarize_filter_meta("not-a-dict") == {}
+
+
+def test_summarize_filter_meta_projects_ui_fields():
+    """Pin the trimmed projection the dashboard renders on each FailureCard."""
+    meta = {
+        "confidence": "high",  # lowercased to verify normalisation
+        "activated_detectors": ["java_stack", "generic_shell", ""],
+        "primary_location": {
+            "kind": "source",
+            "file": "PaymentClient.java",
+            "line": 84,
+            "function": "charge",
+            "message": "ConnectException: Connection refused",
+        },
+        "raw_chars": 12000,
+        "body_chars": 1200,
+        "body_tokens": 320,
+        "selected_count": 12,
+        "baseline_version": "self-baseline",
+        "collapse_stats": {"banner": 1, "stack-frame-elided": 7},
+        # Extra keys must be ignored (forward-compatibility).
+        "extra_unrelated": "should-be-dropped",
+    }
+    out = _summarize_filter_meta(meta)
+    assert out["confidence"] == "HIGH"
+    assert out["activated_detectors"] == ["java_stack", "generic_shell"]
+    assert out["primary_location"]["file"] == "PaymentClient.java"
+    assert out["raw_chars"] == 12000
+    assert out["body_chars"] == 1200
+    assert out["body_tokens"] == 320
+    assert out["collapse_stats"] == {"banner": 1, "stack-frame-elided": 7}
+    assert "extra_unrelated" not in out
+
+
+def test_to_result_item_attaches_filter_meta_summary():
+    row = {
+        "id": "abc-123",
+        "job_full_name": "team/web",
+        "build_number": 4,
+        "stage_name": "Test",
+        "fingerprint": "stage:Test | exceptions: AssertionError",
+        "filtered_logs": "...",
+        "analysis": "boom",
+        "suggested_fix": "do this",
+        "recommendation": "fresh_analysis",
+        "feedback_status": "",
+        "created_at": "2026-04-18T00:00:00Z",
+        "filter_meta": {
+            "confidence": "MEDIUM",
+            "activated_detectors": ["generic_shell"],
+            "raw_chars": 4000,
+            "body_chars": 800,
+            "body_tokens": 200,
+        },
+    }
+    item = _to_result_item(row)
+    # Legacy fields stay untouched (backwards compat with test_to_result_item_normalizes_fields).
+    assert item["run_id"] == "abc-123"
+    # New field carries through the projection.
+    assert item["filter_meta"]["confidence"] == "MEDIUM"
+    assert item["filter_meta"]["activated_detectors"] == ["generic_shell"]
+
+
+def test_to_result_item_emits_empty_filter_meta_for_legacy_rows():
+    """Pre-rewrite rows lack the column — must not crash, must not lie."""
+    row = {
+        "id": "legacy-1",
+        "job_full_name": "team/old",
+        "build_number": 1,
+        "stage_name": "",
+        "fingerprint": "",
+        "filtered_logs": "",
+        "analysis": "",
+        "suggested_fix": "",
+        "recommendation": "",
+        "feedback_status": "",
+        "created_at": "2026-01-01T00:00:00Z",
+        # no filter_meta key at all
+    }
+    item = _to_result_item(row)
+    assert item["filter_meta"] == {}

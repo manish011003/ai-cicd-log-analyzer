@@ -4,6 +4,7 @@ import type { ProcessedStage } from "@/lib/types";
 import { stripMatchStatusFromAnalysis } from "@/lib/sanitizeAnalysis";
 import MarkdownRenderer from "./MarkdownRenderer";
 import ErrorClassBadge from "./ErrorClassBadge";
+import FilterMetaPanel from "./FilterMetaPanel";
 
 interface Props {
   stage: ProcessedStage;
@@ -81,6 +82,8 @@ export default function FailureCard({ stage, onFeedbackSaved }: Props) {
           {stage.signature || "N/A"}
         </p>
       </div>
+
+      <FilterMetaPanel meta={stage.filter_meta} className="mb-6" />
 
       <div className="grid gap-4 xl:grid-cols-2">
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">

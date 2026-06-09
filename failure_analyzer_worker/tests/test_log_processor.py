@@ -73,9 +73,10 @@ def test_filter_logs_normalizes_crlf_and_bom():
 def test_filter_logs_collapses_consecutive_duplicates_with_marker():
     repeated = "\n".join(["WARN msg"] * 12) + "\nERROR boom\n"
     out = filter_logs(repeated)
-    # Only one copy survives, with a "(repeated)" marker, and ERROR is preserved.
-    assert out.count("WARN msg") == 1
-    assert "(repeated)" in out
+    # The new structural collapser keeps the first and last occurrences and
+    # annotates the last with "(repeated N× over … lines)". ERROR is preserved.
+    assert out.count("WARN msg") <= 2  # first + last survive; interior dropped
+    assert "repeated" in out  # exact format: "(repeated 12× over 12 lines)"
     assert "ERROR boom" in out
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
@@ -102,6 +103,10 @@ class SessionCreate(BaseModel):
     match_score: float = 0.0
     recommendation: str = ""
     similar_past: list[dict[str, Any]] = Field(default_factory=list)
+    # Structural-filter telemetry from the worker (confidence, detected
+    # stack, primary location, collapse stats). Kept as an opaque dict so
+    # the web-backend doesn't need to track the worker's filter schema.
+    filter_meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageIn(BaseModel):
@@ -140,8 +145,41 @@ def _extract_error_class(row: dict[str, Any]) -> str:
     return "UnknownError"
 
 
+def _summarize_filter_meta(meta: Any) -> dict[str, Any]:
+    """Project the worker's filter telemetry into a UI-friendly shape.
+
+    We deliberately keep this lossy: the dashboard only needs the badges
+    (confidence, detected stack, primary location) and a couple of
+    compression numbers — the full structural metadata stays in Postgres
+    for future deep-dives but is not pushed over the wire on every list
+    refresh.
+    """
+    if not isinstance(meta, dict) or not meta:
+        return {}
+    primary = meta.get("primary_location") or None
+    if not isinstance(primary, dict):
+        primary = None
+    detectors = meta.get("activated_detectors") or []
+    if not isinstance(detectors, list):
+        detectors = []
+    out: dict[str, Any] = {
+        "confidence": str(meta.get("confidence") or "").upper() or None,
+        "activated_detectors": [str(d) for d in detectors if d],
+        "primary_location": primary,
+        "raw_chars": int(meta.get("raw_chars") or 0),
+        "body_chars": int(meta.get("body_chars") or 0),
+        "body_tokens": int(meta.get("body_tokens") or 0),
+        "selected_count": int(meta.get("selected_count") or 0),
+        "baseline_version": meta.get("baseline_version") or None,
+    }
+    if isinstance(meta.get("collapse_stats"), dict):
+        out["collapse_stats"] = {str(k): int(v) for k, v in meta["collapse_stats"].items()}
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
 def _to_result_item(row: dict[str, Any]) -> dict[str, Any]:
     feedback_status = str(row.get("feedback_status") or "")
+    filter_summary = _summarize_filter_meta(row.get("filter_meta"))
     return {
         "run_id": str(row.get("id")),
         "job_full_name": row.get("job_full_name") or "",
@@ -156,6 +194,9 @@ def _to_result_item(row: dict[str, Any]) -> dict[str, Any]:
         "analysis": row.get("analysis") or "",
         "suggested_fix": row.get("suggested_fix") or "",
         "feedback_status": feedback_status or "new",
+        # Empty dict when the worker did not provide telemetry (older
+        # builds, legacy rows) so the UI can branch on Object.keys.
+        "filter_meta": filter_summary,
     }
 
 
@@ -320,6 +361,7 @@ def create_session(body: SessionCreate) -> dict[str, Any]:
         match_score=body.match_score,
         recommendation=body.recommendation,
         similar_past=body.similar_past,
+        filter_meta=body.filter_meta,
     )
     row = db.fetch_session(sid)
     return {"id": sid, "session": _json_safe(dict(row)) if row else {}}
@@ -398,6 +440,9 @@ def post_feedback(session_id: str, body: FeedbackIn) -> dict[str, Any]:
             logger.exception("worker store-solution failed")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         db.set_feedback_status(session_id, "accepted")
+        # Invalidate the knowledge-graph cache: a new accepted solution
+        # changes both the node count and (potentially) the similarity edges.
+        _kg_cache.update({"key": None, "value": None, "expires": 0.0})
         return {"status": "accepted", "worker": r.json()}
 
     db.set_feedback_status(session_id, "rejected")
@@ -445,6 +490,162 @@ def get_result_by_run_id(run_id: str) -> dict[str, Any]:
     if not row:
         return {"count": 0, "results": []}
     return {"count": 1, "results": [_json_safe(_to_result_item(dict(row)))]}
+
+
+# ── Knowledge graph (proxied from worker, enriched from Postgres) ──────────
+#
+# We TTL-cache the worker response in-process so opening the dashboard's
+# Knowledge Map tab doesn't pound /knowledge-graph on every refresh. The
+# graph itself doesn't change between accepts, so a 60s window is safe.
+
+_KG_CACHE_TTL_S = 60.0
+_kg_cache: dict[str, Any] = {"key": None, "value": None, "expires": 0.0}
+
+
+def _kg_cache_key(limit: int, similarity: float, max_neighbours: int) -> str:
+    return f"{limit}|{similarity:.4f}|{max_neighbours}"
+
+
+def _enrich_knowledge_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    """Merge Postgres counts into the worker graph payload.
+
+    * Per-solution: ``pg_session_count`` (sessions sharing this fingerprint).
+    * Top-level stats: KB-coverage / reuse counts derived from
+      ``analysis_sessions``.
+    """
+    nodes = graph.get("nodes") or []
+    try:
+        fp_counts = db.fingerprint_session_counts()
+    except Exception:
+        logger.warning("knowledge-graph: fingerprint_session_counts failed", exc_info=True)
+        fp_counts = {}
+    try:
+        reuse = db.reuse_summary()
+    except Exception:
+        logger.warning("knowledge-graph: reuse_summary failed", exc_info=True)
+        reuse = {"accepted_sessions": 0, "matched_sessions": 0, "total_sessions": 0}
+
+    for node in nodes:
+        if node.get("kind") != "solution":
+            continue
+        fp = str(node.get("fingerprint_text") or "")
+        node["pg_session_count"] = int(fp_counts.get(fp, 0)) if fp else 0
+
+    stats = graph.setdefault("stats", {})
+    accepted = int(reuse.get("accepted_sessions") or 0)
+    total_solutions = int(stats.get("total_solutions") or 0)
+    coverage = (total_solutions / accepted) if accepted > 0 else 0.0
+    stats.update(
+        {
+            "accepted_sessions": accepted,
+            "matched_sessions": int(reuse.get("matched_sessions") or 0),
+            "total_sessions": int(reuse.get("total_sessions") or 0),
+            "kb_coverage": round(min(1.0, coverage), 3),
+        },
+    )
+    return graph
+
+
+@app.get("/api/knowledge-graph")
+def get_knowledge_graph(
+    limit: int = Query(default=2000, ge=1, le=10_000),
+    similarity: float = Query(default=0.0, ge=0.0, le=1.0),
+    max_neighbours: int = Query(default=6, ge=1, le=25),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Return the typed knowledge graph + KB metrics.
+
+    Backed by the worker's ``/knowledge-graph`` endpoint with a small in-process
+    TTL so dashboard refreshes don't slam Elasticsearch. Pass ``refresh=true``
+    to bypass the cache (useful right after an Accept).
+    """
+    key = _kg_cache_key(limit, similarity, max_neighbours)
+    now = time.monotonic()
+    if (
+        not refresh
+        and _kg_cache.get("key") == key
+        and _kg_cache.get("value") is not None
+        and now < float(_kg_cache.get("expires") or 0.0)
+    ):
+        return _kg_cache["value"]  # type: ignore[no-any-return]
+
+    url = f"{settings.worker_base_url.rstrip('/')}/knowledge-graph"
+    params = {
+        "limit": limit,
+        "similarity": similarity,
+        "max_neighbours": max_neighbours,
+    }
+    try:
+        r = httpx.get(
+            url,
+            headers={"X-Api-Key": settings.worker_api_key},
+            params=params,
+            timeout=60.0,
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        body = (exc.response.text or "").strip()
+        logger.error("worker knowledge-graph HTTP %s: %s", exc.response.status_code, body)
+        raise HTTPException(status_code=502, detail=body or str(exc)) from exc
+    except httpx.HTTPError as exc:
+        logger.exception("worker knowledge-graph fetch failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    enriched = _enrich_knowledge_graph(r.json() or {})
+    _kg_cache.update(
+        {"key": key, "value": enriched, "expires": now + _KG_CACHE_TTL_S},
+    )
+    return enriched
+
+
+# ── Filter configuration (proxied from worker) ─────────────────────────────
+#
+# The worker is the source of truth for which detectors are loaded and
+# which knobs are active. We TTL-cache the response so the Settings page
+# can be opened repeatedly without re-hitting the worker — the config
+# only changes on worker restart, so a 60s window is conservative.
+
+_FILTER_CONFIG_CACHE_TTL_S = 60.0
+_filter_config_cache: dict[str, Any] = {"value": None, "expires": 0.0}
+
+
+@app.get("/api/filter-config")
+def get_filter_config(
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Return the worker's live filter configuration.
+
+    Powers the platform's *Settings → Log Filter* page. Read-only by
+    design: changing values still requires editing ``.env`` and restarting
+    the worker. Pass ``refresh=true`` to bypass the cache.
+    """
+    now = time.monotonic()
+    cached = _filter_config_cache.get("value")
+    expires = float(_filter_config_cache.get("expires") or 0.0)
+    if not refresh and cached is not None and now < expires:
+        return cached  # type: ignore[no-any-return]
+
+    url = f"{settings.worker_base_url.rstrip('/')}/filter-config"
+    try:
+        r = httpx.get(
+            url,
+            headers={"X-Api-Key": settings.worker_api_key},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        body = (exc.response.text or "").strip()
+        logger.error("worker filter-config HTTP %s: %s", exc.response.status_code, body)
+        raise HTTPException(status_code=502, detail=body or str(exc)) from exc
+    except httpx.HTTPError as exc:
+        logger.exception("worker filter-config fetch failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    payload = r.json() or {}
+    _filter_config_cache.update(
+        {"value": payload, "expires": now + _FILTER_CONFIG_CACHE_TTL_S},
+    )
+    return payload
 
 
 @app.post("/api/listener/poll-once")

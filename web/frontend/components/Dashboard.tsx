@@ -1,16 +1,20 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchDiagnostics, fetchResults, fetchStats, pollListenerOnce } from "@/lib/api";
 import type { DiagnosticsResponse, ProcessedStage, StatsResponse } from "@/lib/types";
 import ChatPanel from "./ChatPanel";
 import FailureCard from "./FailureCard";
+import KnowledgeMap from "./KnowledgeMap";
 import StatsBar from "./StatsBar";
 import ThemeToggle from "./ui/theme-toggle";
 import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 
 const POLL_INTERVAL_MS = 10000;
+
+type DashboardView = "builds" | "knowledge";
 
 function stageRowKey(stage: ProcessedStage, flatIndex: number) {
   return `${stage.run_id}-${stage.stage_name}-${flatIndex}`;
@@ -38,6 +42,7 @@ export default function Dashboard() {
   const [diag, setDiag] = useState<DiagnosticsResponse | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [selectedStageRowKey, setSelectedStageRowKey] = useState<string | null>(null);
+  const [view, setView] = useState<DashboardView>("builds");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = useCallback(
@@ -225,40 +230,76 @@ export default function Dashboard() {
           </div>
 
           <div className="flex items-center gap-2">
-            {lastUpdated && (
+            <div
+              className="mr-1 inline-flex overflow-hidden rounded-md border border-slate-300 dark:border-slate-700"
+              role="tablist"
+              aria-label="Dashboard view"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === "builds"}
+                onClick={() => setView("builds")}
+                className={`px-3 py-1 text-xs font-medium transition ${
+                  view === "builds"
+                    ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+                    : "bg-white text-slate-700 hover:bg-slate-100 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-900"
+                }`}
+              >
+                Builds
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === "knowledge"}
+                onClick={() => setView("knowledge")}
+                className={`px-3 py-1 text-xs font-medium transition ${
+                  view === "knowledge"
+                    ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+                    : "bg-white text-slate-700 hover:bg-slate-100 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-900"
+                }`}
+              >
+                Knowledge Map
+              </button>
+            </div>
+            {lastUpdated && view === "builds" && (
               <span className="mr-2 text-xs tabular-nums text-slate-500 dark:text-slate-400">{lastUpdated.toLocaleTimeString()}</span>
             )}
             <ThemeToggle />
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() =>
-                void (async () => {
-                  await runListenerPoll();
-                  await load(activeFilter, true);
-                  try {
-                    setDiag(await fetchDiagnostics());
-                  } catch {
-                    /* ignore */
+            {view === "builds" && (
+              <>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() =>
+                    void (async () => {
+                      await runListenerPoll();
+                      await load(activeFilter, true);
+                      try {
+                        setDiag(await fetchDiagnostics());
+                      } catch {
+                        /* ignore */
+                      }
+                    })()
                   }
-                })()
-              }
-              disabled={refreshing}
-            >
-              {refreshing ? "Refreshing..." : "Refresh"}
-            </Button>
-            <Button
-              variant={polling ? "default" : "outline"}
-              size="sm"
-              onClick={() => setPolling((v) => !v)}
-            >
-              <span
-                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                  polling ? "animate-pulse bg-emerald-400" : "bg-slate-400 dark:bg-slate-500"
-                }`}
-              />
-              {polling ? "Live" : "Auto-poll"}
-            </Button>
+                  disabled={refreshing}
+                >
+                  {refreshing ? "Refreshing..." : "Refresh"}
+                </Button>
+                <Button
+                  variant={polling ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setPolling((v) => !v)}
+                >
+                  <span
+                    className={`inline-block h-1.5 w-1.5 rounded-full ${
+                      polling ? "animate-pulse bg-emerald-400" : "bg-slate-400 dark:bg-slate-500"
+                    }`}
+                  />
+                  {polling ? "Live" : "Auto-poll"}
+                </Button>
+              </>
+            )}
             <Button
               variant={chatOpen ? "default" : "outline"}
               size="sm"
@@ -266,10 +307,21 @@ export default function Dashboard() {
             >
               Chat
             </Button>
+            <Link href="/settings" aria-label="Open settings page">
+              <Button variant="outline" size="sm">
+                Settings
+              </Button>
+            </Link>
           </div>
         </header>
 
         <div className="flex min-h-0 flex-1">
+          {view === "knowledge" ? (
+            <div className="flex min-w-0 flex-1 flex-col p-6">
+              <KnowledgeMap />
+            </div>
+          ) : (
+          <>
           <aside className="w-[330px] shrink-0 border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950/70">
             <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
               <h2 className="text-sm font-semibold">Build Index</h2>
@@ -435,6 +487,8 @@ export default function Dashboard() {
               )}
             </div>
           </div>
+          </>
+          )}
         </div>
       </div>
 

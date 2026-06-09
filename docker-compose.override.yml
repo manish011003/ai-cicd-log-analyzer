@@ -1,0 +1,8 @@
+# Local override (not tracked in git).
+# Reuses the pre-existing top-level "jenkins_home" volume that holds the
+# user's existing Jenkins jobs, plugins, and build history, instead of
+# letting Compose create a fresh project-scoped one.
+volumes:
+  jenkins_home:
+    external: true
+    name: jenkins_home

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .embeddings import Embedder, create_embedder
+from .filtering import Filter, create_filter
 from .llm import LLMClient, create_llm
 from .prompts import PromptLoader
 from .vectorstore import SolutionRepository, create_solution_repository
@@ -30,6 +31,7 @@ class Deps:
     embedder: Embedder
     solutions: SolutionRepository
     prompts: PromptLoader
+    filter: Filter
 
 
 def build_deps(settings: "WorkerSettings") -> Deps:
@@ -41,4 +43,5 @@ def build_deps(settings: "WorkerSettings") -> Deps:
         embedder=embedder,
         solutions=create_solution_repository(settings, embedder),
         prompts=PromptLoader(settings.prompts_dir or None),
+        filter=create_filter(settings),
     )

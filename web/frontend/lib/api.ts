@@ -1,6 +1,8 @@
 import type {
   ChatResponse,
   DiagnosticsResponse,
+  FilterConfigResponse,
+  KnowledgeGraphResponse,
   ListenerPollResponse,
   ResultsResponse,
   SessionDetail,
@@ -73,4 +75,24 @@ export async function sendChatMessage(
 
 export async function fetchSessionDetail(runId: string): Promise<SessionDetail> {
   return readJson<SessionDetail>(`${BASE}/sessions/${encodeURIComponent(runId)}`);
+}
+
+export async function fetchFilterConfig(refresh = false): Promise<FilterConfigResponse> {
+  const qs = refresh ? "?refresh=true" : "";
+  return readJson<FilterConfigResponse>(`${BASE}/filter-config${qs}`);
+}
+
+export async function fetchKnowledgeGraph(opts?: {
+  limit?: number;
+  similarity?: number;
+  maxNeighbours?: number;
+  refresh?: boolean;
+}): Promise<KnowledgeGraphResponse> {
+  const params = new URLSearchParams();
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  if (opts?.similarity) params.set("similarity", String(opts.similarity));
+  if (opts?.maxNeighbours) params.set("max_neighbours", String(opts.maxNeighbours));
+  if (opts?.refresh) params.set("refresh", "true");
+  const qs = params.toString();
+  return readJson<KnowledgeGraphResponse>(`${BASE}/knowledge-graph${qs ? `?${qs}` : ""}`);
 }

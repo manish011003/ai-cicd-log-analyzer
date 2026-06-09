@@ -10,12 +10,13 @@ accepted solution is the only payload we ever need to reuse. Raw log
 excerpts live in Postgres alongside their sessions.
 """
 
-from .base import Solution, SolutionMatch, SolutionRepository
+from .base import Solution, SolutionMatch, SolutionRecord, SolutionRepository
 from .factory import create_solution_repository
 
 __all__ = [
     "Solution",
     "SolutionMatch",
+    "SolutionRecord",
     "SolutionRepository",
     "create_solution_repository",
 ]
