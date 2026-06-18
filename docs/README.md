@@ -6,6 +6,7 @@ drop into the per-feature page that matches what you’re working on.
 | Document                                                       | What it covers                                              |
 | -------------------------------------------------------------- | ----------------------------------------------------------- |
 | [architecture.md](architecture.md)                             | Service map, data stores, request lifecycle                 |
+| [technical_deets.md](technical_deets.md)                       | Full HLD + LLD: pipeline, modules, data model, ops, perf    |
 | [folder-structure.md](folder-structure.md)                     | Why the repo is laid out the way it is                      |
 | [failure-analyzer-worker.md](failure-analyzer-worker.md)       | LangGraph + Groq + ES worker (port 8090)                    |
 | [jenkins-failure-listener.md](jenkins-failure-listener.md)     | Jenkins → worker bridge (port 8088)                         |

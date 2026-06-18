@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import { useTheme } from "next-themes";
 import { fetchKnowledgeGraph } from "@/lib/api";
 import type {
   KnowledgeEdge,
@@ -63,6 +64,8 @@ export default function KnowledgeMap() {
   const [filter, setFilter] = useState<FilterState>(() => defaultFilter());
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 800, h: 560 });
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === "dark";
 
   const load = useCallback(async (refresh = false) => {
     setLoading(true);
@@ -151,7 +154,7 @@ export default function KnowledgeMap() {
       ctx.fill();
       if (isSelected) {
         ctx.lineWidth = 2 / globalScale;
-        ctx.strokeStyle = "#0f172a";
+        ctx.strokeStyle = isDark ? "#f8fafc" : "#0f172a";
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
@@ -161,17 +164,22 @@ export default function KnowledgeMap() {
         const label = node.label || node.id;
         const fontSize = Math.max(9, 11 / globalScale);
         ctx.font = `${fontSize}px ui-sans-serif, system-ui, sans-serif`;
-        ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
         ctx.textAlign = "left";
         ctx.textBaseline = "middle";
-        ctx.fillText(
-          label.length > 36 ? `${label.slice(0, 35)}…` : label,
-          (node.x ?? 0) + r + 4,
-          node.y ?? 0,
-        );
+        const x = (node.x ?? 0) + r + 4;
+        const y = node.y ?? 0;
+        const text = label.length > 36 ? `${label.slice(0, 35)}…` : label;
+        // Halo so the label stays legible over node fills and either bg.
+        ctx.lineWidth = Math.max(2, 3 / globalScale);
+        ctx.strokeStyle = isDark ? "rgba(2, 6, 23, 0.85)" : "rgba(255, 255, 255, 0.85)";
+        ctx.lineJoin = "round";
+        ctx.miterLimit = 2;
+        ctx.strokeText(text, x, y);
+        ctx.fillStyle = isDark ? "rgba(226, 232, 240, 0.95)" : "rgba(15, 23, 42, 0.85)";
+        ctx.fillText(text, x, y);
       }
     },
-    [nodeRadius, selectedId],
+    [nodeRadius, selectedId, isDark],
   );
 
   const edgeColor = useCallback(
