@@ -66,12 +66,36 @@ what lets us add detectors freely without worrying about ordering bugs.
 | ------------------- | -------: | ----------------------------------------------------------------------------------------- |
 | `java_stack`        | 50       | Picks the topmost project frame from Java/Kotlin/Scala stack traces (filters out framework frames such as `java.*`, `org.springframework.*`). |
 | `python_traceback`  | 50       | Picks the bottom-most project frame in Python tracebacks; understands chained `during handling of` blocks. |
+| `node_stack`        | 50       | Picks the topmost non-`node_modules` / non-`node:internal` frame from V8 stack traces; carries the `TypeError`/`Error` class through as the message. Built on `GenericStackDetector`. |
+| `go_panic`          | 50       | Picks the topmost project frame from Go goroutine backtraces, recovers the function name from the line above each `file.go:N` frame, and skips `GOROOT` / `/go/pkg/mod/` / runtime frames. Built on `GenericStackDetector`. |
 | `generic_shell`     | 0        | Stack-agnostic floor: finds the last command before a non-zero exit and points there.    |
 
-Each detector exposes a one-line description (its class docstring) that
-shows up on the Settings page. Adding a new detector means dropping a
-file under `failure_analyzer_worker/filtering/detectors/` and listing it
-in `_BUNDLED`; the UI inventory updates automatically.
+The Settings page reads each detector's one-line description from the
+**instance** first (so the two `GenericStackDetector`-backed entries
+above get distinct Node / Go descriptions even though they share a class)
+and falls back to the class docstring otherwise.
+
+### Two ways to add a new detector
+
+1. **Data-driven (recommended for most stacks).** Construct a
+   :class:`StackLanguage` config — pattern, framework path list, bug-site
+   convention, optional cause regex — and register a
+   `GenericStackDetector(<config>)`. See
+   `failure_analyzer_worker/filtering/detectors/node_stack.py` and
+   `go_panic.py` for ~30-line examples. This is the stepping stone to
+   the upcoming Layer 2 declarative YAML loader, which will replace the
+   thin Python module with a `<name>.yaml` spec hydrating the same
+   `StackLanguage` — no rebuild required.
+2. **Hand-written (for stacks with algorithmic nuance).** Drop a module
+   under `failure_analyzer_worker/filtering/detectors/<your_name>.py`,
+   define a class with `name`, `priority`, `activates_on`, and
+   `contribute`. Use this path when the language has structure that a
+   regex can't express on its own (e.g. Python's chained-traceback
+   bridges, Java's JPMS module prefixes + 30-entry framework allowlist +
+   `Caused-by` chain walker).
+
+In both cases, add the name to `_BUNDLED` in
+`detectors/__init__.py` and the UI inventory updates automatically.
 
 ### Activation flow
 
@@ -192,6 +216,46 @@ the UI treats an empty object as "no telemetry" and hides the
 
 ## Adding a new detector
 
+### Option A — Data-driven (`GenericStackDetector`, preferred)
+
+For any language whose failure shape fits *probe → frame regex →
+framework path list → top-or-bottom bug site*, you don't need to write a
+detector class at all — just construct a `StackLanguage` and register a
+`GenericStackDetector` instance:
+
+```python
+# failure_analyzer_worker/filtering/detectors/ruby_stack.py
+from . import register
+from .generic_stack import GenericStackDetector, StackLanguage
+
+register(GenericStackDetector(StackLanguage(
+    name="ruby_stack",
+    priority=50,
+    description="Localizes Ruby failures to the topmost project frame.",
+    probe_pattern=r"^\s+from\s+\S+\.rb:\d+",
+    frame_pattern=r"^\s+from\s+(?P<file>\S+\.rb):(?P<line>\d+)(?::in\s+`(?P<function>[^']+)')?",
+    framework_paths=("/usr/lib/ruby/", "/gems/"),
+    bug_site="top",
+    cause_pattern=r"^(?P<cls>[\w:]*[A-Z]\w*(?:Error|Exception))(?::\s*(?P<msg>.*))?$",
+    cause_position="above",
+)))
+```
+
+Then add `"ruby_stack"` to `_BUNDLED` in `detectors/__init__.py`. Done.
+
+`StackLanguage` also exposes a `run_separator_pattern` knob for runtimes
+whose stack traces contain decorative "frame-shaped" lines that don't
+carry a file:line (V8's `at async Promise.all (index 0)`, Go's function-
+name line between every two `file.go:NN` frames). See `node_stack.py`
+and `go_panic.py` for working examples.
+
+### Option B — Hand-written
+
+For stacks with algorithmic nuance a regex can't express on its own
+(Java's JPMS module prefixes + curated framework allowlist + cause-chain
+walker; Python's chained-traceback bridges + body-source snippet
+extraction), write a class against the `Detector` protocol directly:
+
 1. Drop a module under
    `failure_analyzer_worker/filtering/detectors/<your_name>.py`.
 2. Define a class with `name`, `priority`, `activates_on`, and
@@ -200,9 +264,13 @@ the UI treats an empty object as "no telemetry" and hides the
 3. Call `register(YourDetector())` at module scope.
 4. Add `"<your_name>"` to `_BUNDLED` in `detectors/__init__.py`.
 
+### Tests
+
 Unit tests live under `failure_analyzer_worker/tests/` — see
-`test_filtering_universal.py` for examples that exercise the
-end-to-end `FilterResult` shape (locations, confidence, body).
+`test_filtering_universal.py` for hand-written detector examples and
+`test_filtering_generic_stack.py` for `GenericStackDetector` /
+`StackLanguage` coverage. Both exercise the end-to-end `FilterResult`
+shape (locations, confidence, body).
 
 ---
 

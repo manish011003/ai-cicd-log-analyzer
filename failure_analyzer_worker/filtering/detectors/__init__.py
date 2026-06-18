@@ -55,6 +55,8 @@ def registered() -> dict[str, Detector]:
 _BUNDLED: tuple[str, ...] = (
     "java_stack",
     "python_traceback",
+    "node_stack",
+    "go_panic",
     "generic_shell",
 )
 

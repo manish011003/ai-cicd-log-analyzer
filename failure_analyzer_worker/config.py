@@ -83,6 +83,11 @@ class WorkerSettings(BaseSettings):
     embedding_dimensions: int = Field(default=0, alias="EMBEDDING_DIMENSIONS")
     embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
     embedding_api_base: str = Field(default="", alias="EMBEDDING_API_BASE")
+    # Set to "0" only behind a corporate MITM proxy with a self-signed root CA.
+    # HuggingFace LFS-served model blobs go through a CDN whose TLS chain the
+    # container won't trust; without this the first model download hangs and
+    # the worker never finishes startup.
+    embedding_tls_verify: str = Field(default="1", alias="EMBEDDING_TLS_VERIFY")
 
     # ── LLM ───────────────────────────────────────────────────────────────────
     llm_provider: str = Field(default="groq", alias="LLM_PROVIDER")

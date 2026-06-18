@@ -59,10 +59,21 @@ def create_filter(settings: "WorkerSettings") -> Filter:
 def _detector_description(det: Detector) -> str:
     """Return a one-line human description for ``det``.
 
-    Pulled from the detector class' docstring so adding a new detector
-    automatically gets its description on the Settings page — no second
-    place to remember to update.
+    Resolution order:
+
+    1. **Instance-level ``description`` attribute** — used by
+       :class:`GenericStackDetector` (and the upcoming Layer 2 declarative
+       loader) so multiple detectors that share one class can each carry
+       their own one-liner.
+    2. **Class docstring's first non-blank line** — the convention for the
+       hand-written detectors (``java_stack``, ``python_traceback``,
+       ``generic_shell``). Adding a new hand-written detector
+       automatically gets its description on the Settings page.
+    3. **Class name** — last-resort fallback so the UI never shows blank.
     """
+    instance_desc = getattr(det, "description", None)
+    if isinstance(instance_desc, str) and instance_desc.strip():
+        return instance_desc.strip().splitlines()[0]
     doc = getattr(det.__class__, "__doc__", None) or ""
     first = next((ln.strip() for ln in doc.splitlines() if ln.strip()), "")
     return first or det.__class__.__name__

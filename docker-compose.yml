@@ -105,6 +105,10 @@ services:
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-0}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      # Set EMBEDDING_TLS_VERIFY=0 in .env only behind a corporate MITM proxy
+      # with a self-signed root CA — HuggingFace CDN blobs go through a 302
+      # redirect whose TLS chain the container won't otherwise trust.
+      EMBEDDING_TLS_VERIFY: ${EMBEDDING_TLS_VERIFY:-1}
       # Vector store --------------------------------------------------------
       VECTOR_STORE_PROVIDER: ${VECTOR_STORE_PROVIDER:-elasticsearch}
       ELASTICSEARCH_URL: http://elasticsearch:9200
