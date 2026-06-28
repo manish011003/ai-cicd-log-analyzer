@@ -70,14 +70,16 @@ for ad-hoc inspection of the Elasticsearch indices on `http://localhost:5601`.
    - Calls `generate_fingerprint()` to form a stable, semantic key.
    - Searches Elasticsearch for similar fingerprints (cosine kNN).
    - Asks Groq for an analysis + suggested fix (LangGraph state machine).
-   - POSTs a new “session” row to the web-backend so the user can land on a
-     stable URL like `http://localhost:3080/?session=<uuid>`.
+   - POSTs a new “session” row to the web-backend. The failure then appears in
+     the Overview dashboard, and its drill-in lives at a stable URL like
+     `http://localhost:3080/rca?run=<run_id>`.
 6. Web-backend persists everything in Postgres and exposes it under
-   `/api/sessions/...`.
-7. Web-frontend (Next.js) renders the dashboard, lets the user chat, accept,
-   or reject the suggested fix; an accepted fix is sent back to the worker
-   `/store-solution` endpoint and indexed in Elasticsearch for future kNN
-   matches.
+   `/api/sessions/...` and `/api/results`.
+7. Web-frontend (Next.js) renders the Overview dashboard (matrix + filters +
+   failed-build table) and a focused Root Cause Analysis page; it lets the user
+   chat, accept, or reject the suggested fix. An accepted fix is sent back to
+   the worker `/store-solution` endpoint and indexed in Elasticsearch for
+   future kNN matches.
 
 ## Repository layout
 

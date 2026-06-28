@@ -41,8 +41,8 @@ shared `docker/` and `docs/` folders provide the cross-cutting plumbing.
 │   │   ├── requirements.txt
 │   │   └── .env.example
 │   └── frontend/                    # Next.js 16 dashboard (port 3000)
-│       ├── app/                     # App Router pages
-│       ├── components/              # React components (Dashboard, ChatPanel, ...)
+│       ├── app/                     # App Router pages (/, /rca, /settings)
+│       ├── components/              # React components (MainDashboard, RcaView, ...)
 │       ├── lib/                     # shared TS utilities
 │       ├── public/
 │       ├── package.json

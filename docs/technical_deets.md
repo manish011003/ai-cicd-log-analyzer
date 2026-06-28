@@ -108,8 +108,8 @@ CI/CD failures in Jenkins (and other CI systems) generate large, noisy logs. Eng
                                                             ▼
                                              ┌──────────────────────────────┐
                                              │ web/frontend  Next.js 16     │
-                                             │  - Dashboard, FailureCard    │
-                                             │  - ChatPanel, FilterMeta     │
+                                             │  - MainDashboard (/) overview│
+                                             │  - RcaView (/rca) + ChatPanel│
                                              │  - Knowledge graph viewer    │
                                              │  - /settings (filter-config) │
                                              └──────────────────────────────┘
@@ -327,12 +327,12 @@ Both leaves call `deps.llm.invoke([ChatMessage(role="system", ...), ChatMessage(
 `_register_web_sessions(rows)`:
 - For each row, POSTs to `WEB_UI_API_URL/api/sessions`.
 - Body carries everything the UI needs: job/build/stage/url, fingerprint, analysis, suggested_fix, filtered_logs, raw_logs (capped at `RAW_LOG_MAX_CHARS=200000`), matched_solution, match_score, recommendation, similar_past, **filter_meta** (full dict including primary_location, collapse_stats, etc.).
-- Response carries the session UUID → worker stamps `web_session_url = f"{WEB_UI_PUBLIC_URL}/?session={sid}"` in the row.
+- Response carries the session UUID → worker stamps `web_session_url = f"{WEB_UI_PUBLIC_URL}/rca?run={sid}"` in the row (deep-links straight to the RCA page).
 - Failures are logged but don't fail the ingest — the analysis is still returned to the listener.
 
 #### [8] UI render & chat
-- Browser hits `/?session=<uuid>` → Next.js page fetches `/api/sessions/<uuid>`.
-- `Dashboard` lists sessions; `FailureCard` shows analysis + suggested_fix; `FilterMetaPanel` shows confidence badge + detector chips + primary location + compression ratio; `ChatPanel` shows message history.
+- The failure shows up in the Overview dashboard (`/`); the operator clicks its row to open `/rca?run=<run_id>`.
+- `MainDashboard` (Overview) renders the matrix, filter bar, and build-grouped failures table; `RcaView` (the `/rca` page) renders one failure: `FailureCard` shows analysis + suggested_fix; `FilterMetaPanel` shows confidence badge + detector chips + primary location + compression ratio; `ChatPanel` shows message history.
 - User posts a message → web-backend `/api/sessions/{id}/messages`:
   1. `db.insert_message(session_id, "user", content)`.
   2. Pull the entire conversation: `db.list_messages(session_id)`.
@@ -888,23 +888,27 @@ Migrations are **additive `ADD COLUMN IF NOT EXISTS`** — legacy rows just carr
 web/frontend/
 ├── app/
 │   ├── layout.tsx            Self-hosted Inter + JetBrains Mono via next/font/local
-│   ├── page.tsx              Home — Dashboard + ChatPanel + StatsBar
+│   ├── page.tsx              Home — MainDashboard (overview)
+│   ├── rca/page.tsx          RCA drill-in (Suspense-wrapped RcaView)
 │   ├── settings/page.tsx     SettingsPage — reads /api/filter-config
 │   ├── globals.css
 │   └── fonts/                Inter & JetBrains Mono WOFF2
 ├── components/
-│   ├── Dashboard.tsx         Session list + selection
+│   ├── MainDashboard.tsx     Overview: matrix + filter + failures table + KM toggle
+│   ├── RcaView.tsx           Single-failure RCA view (reads ?run=<run_id>)
+│   ├── FilterBar.tsx         Search · date range · status filters
+│   ├── FailuresTable.tsx     Build-grouped failed-stage table → /rca
 │   ├── FailureCard.tsx       Analysis + suggested fix + Accept/Reject
 │   ├── FilterMetaPanel.tsx   "Detected" panel
-│   ├── ChatPanel.tsx         /api/sessions/{id}/messages — survives reloads
-│   ├── StatsBar.tsx          kNN match metadata
+│   ├── ChatPanel.tsx         /agent/chat + /api/sessions/{id} — survives reloads
+│   ├── StatsBar.tsx          Matrix + error breakdown (client-derived metrics)
+│   ├── KnowledgeMap.tsx      Accepted-solutions similarity graph
 │   ├── SettingsPanel.tsx     Read-only knobs + detector inventory
 │   ├── ErrorClassBadge.tsx, theme-provider.tsx, theme-toggle.tsx
-│   └── ui/                   shadcn-style primitives (button, scroll-area, …)
+│   └── ui/                   shadcn-style primitives (button, scroll-area, info-hint, …)
 ├── lib/
-│   ├── fetchResults.ts, fetchSessionDetail.ts, fetchStats.ts,
-│   ├── fetchFilterConfig.ts, fetchKnowledgeGraph.ts, fetchDiagnostics.ts,
-│   ├── pollListenerOnce.ts
+│   ├── api.ts                All fetch helpers (results, sessions, stats, …)
+│   ├── filters.ts            Date presets + scope/error-class filtering + metrics + grouping
 │   ├── sanitizeAnalysis.ts   stripMatchStatusFromAnalysis()
 │   ├── types.ts              Shared TS shapes
 │   └── utils.ts              cn() class-name merge
@@ -915,11 +919,12 @@ web/frontend/
 
 #### 4.4.2 Pages
 
-- `/?session=<uuid>` — Home page deep-link. `app/page.tsx` reads the query param, fetches `/api/sessions/<uuid>`, renders `<Dashboard>` (list view + selection), `<FailureCard>` (analysis + suggested fix + Accept/Reject), `<FilterMetaPanel>` (confidence + detectors + primary location + compression), `<ChatPanel>` (chat history + send), `<StatsBar>` (kNN metadata).
-- `/settings` — `app/settings/page.tsx` fetches `/api/filter-config`, renders `<SettingsPanel>` with three sections: tweakable knobs, active detectors, all bundled detectors (with active/disabled indicator).
+- `/` — Overview. `app/page.tsx` renders `<MainDashboard>`, which fetches `/api/results`, derives the matrix + error breakdown client-side via `lib/filters.ts`, and renders `<StatsBar>`, `<FilterBar>` (search · date range · status), and `<FailuresTable>` (build-grouped rows). An Overview ⇄ Knowledge Map toggle mounts `<KnowledgeMap>` (`/api/knowledge-graph`). Clicking a failed stage routes to `/rca?run=<run_id>`.
+- `/rca?run=<run_id>` — RCA drill-in. `app/rca/page.tsx` (Suspense-wrapped) renders `<RcaView>`, which fetches `/api/results`, finds the row by `run_id`, and renders `<FailureCard>` (analysis + suggested fix + Accept/Reject), `<FilterMetaPanel>` (confidence + detectors + primary location + compression), and `<ChatPanel>` (chat history + send). A "Back to dashboard" button returns to `/`.
+- `/settings` — `app/settings/page.tsx` fetches `/api/filter-config`, renders `<SettingsPanel>` with three sections: tweakable knobs, active detectors, all bundled detectors (with active/disabled indicator). Verbose copy is collapsed into hover `ⓘ` info icons.
 
 #### 4.4.3 Auto-poll
-The "Refresh / Auto-poll" control in the Dashboard calls `pollListenerOnce()` → `POST /api/listener/poll-once` → web-backend → listener `/poll-once`. The UI never talks to the listener directly (avoids CORS + isolates the network topology).
+The "Refresh / Auto-poll" control in the Overview dashboard calls `pollListenerOnce()` → `POST /api/listener/poll-once` → web-backend → listener `/poll-once`. The UI never talks to the listener directly (avoids CORS + isolates the network topology).
 
 #### 4.4.4 Fonts
 Inter + JetBrains Mono are **self-hosted** under `app/fonts/` and wired via `next/font/local`. No `fonts.googleapis.com` access at build time → builds are deterministic, offline-safe, and friendly to corp proxies / air-gapped CI.

@@ -6,6 +6,7 @@ import { fetchFilterConfig } from "@/lib/api";
 import type { DetectorInfo, FilterConfigResponse } from "@/lib/types";
 import ThemeToggle from "./ui/theme-toggle";
 import { Button } from "./ui/button";
+import InfoHint from "./ui/info-hint";
 
 function detectorLabel(name: string): string {
   switch (name) {
@@ -33,9 +34,9 @@ function KnobRow({
 }) {
   return (
     <div className="grid grid-cols-1 gap-1 border-b border-slate-200 px-4 py-3 last:border-b-0 sm:grid-cols-[1fr_minmax(140px,_240px)_minmax(160px,_220px)] sm:items-baseline sm:gap-4 dark:border-slate-800">
-      <div>
+      <div className="flex items-center gap-1.5">
         <p className="text-sm font-medium text-slate-800 dark:text-slate-100">{label}</p>
-        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{hint}</p>
+        <InfoHint side="right" text={hint} />
       </div>
       <p className="font-mono text-sm tabular-nums text-slate-900 dark:text-slate-100">{value}</p>
       <code className="rounded bg-slate-100 px-2 py-1 text-[11px] text-slate-600 dark:bg-slate-900 dark:text-slate-300">
@@ -111,9 +112,15 @@ export default function SettingsPanel() {
             <img src="/DOX.D.svg" alt="CI Failure Analyzer logo" className="h-6 w-6 object-contain" />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">Settings</h1>
+            <div className="flex items-center gap-1.5">
+              <h1 className="text-xl font-bold tracking-tight">Settings</h1>
+              <InfoHint
+                side="bottom"
+                text="Read-only view of the worker's structural log filter. Every failure analysis runs the raw Jenkins log through a four-pass pipeline (tokenize → structural collapse → baseline diff → anchor selection); stack-specific detectors pin down the precise file/line. To change a value, edit the worker's .env and restart the container — see docs/filtering.md for the full reference."
+              />
+            </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Read-only view of the worker&apos;s structural log filter
+              Structural log filter configuration
             </p>
           </div>
         </div>
@@ -137,26 +144,6 @@ export default function SettingsPanel() {
 
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-5xl space-y-6 p-6">
-          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/70">
-            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              What this page shows
-            </h2>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Every failure analysis runs the raw Jenkins log through a four-pass
-              structural filter (tokenize → structural collapse → baseline diff →
-              anchor selection). Stack-specific{" "}
-              <span className="font-medium">detectors</span> plug in to pin down the
-              precise file/line. The knobs below are what control that pipeline.
-            </p>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Changing a value still requires editing the worker&apos;s{" "}
-              <code className="rounded bg-slate-100 px-1 dark:bg-slate-900">.env</code>{" "}
-              and restarting the container. See{" "}
-              <code className="rounded bg-slate-100 px-1 dark:bg-slate-900">docs/filtering.md</code>{" "}
-              for the full reference.
-            </p>
-          </section>
-
           {error && (
             <div className="rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300">
               <span className="mr-2 font-semibold">Error:</span>
@@ -176,12 +163,17 @@ export default function SettingsPanel() {
           {!loading && config && (
             <>
               <section className="rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900/70">
-                <div className="border-b border-slate-200 px-5 py-3 dark:border-slate-800">
-                  <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    Tweakable knobs
-                  </h2>
-                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                    Implementation:{" "}
+                <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-5 py-3 dark:border-slate-800">
+                  <div className="flex items-center gap-1.5">
+                    <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      Tweakable knobs
+                    </h2>
+                    <InfoHint
+                      side="right"
+                      text="These control the structural filter pipeline. Hover any row's info icon for what it does. Changing a value requires editing the worker's .env and restarting the container."
+                    />
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
                     <code className="rounded bg-slate-100 px-1 text-[11px] dark:bg-slate-900">
                       {config.implementation}
                     </code>
@@ -222,15 +214,14 @@ export default function SettingsPanel() {
               </section>
 
               <section className="rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900/70">
-                <div className="border-b border-slate-200 px-5 py-3 dark:border-slate-800">
+                <div className="flex items-center gap-1.5 border-b border-slate-200 px-5 py-3 dark:border-slate-800">
                   <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                     Active detectors
                   </h2>
-                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                    Loaded right now (sorted by priority). Each runs its own cheap
-                    probe before doing work, so they only contribute when their
-                    stack actually shows up in the log.
-                  </p>
+                  <InfoHint
+                    side="right"
+                    text="Detectors loaded right now, sorted by priority. Each runs a cheap probe before doing work, so they only contribute when their stack actually shows up in the log."
+                  />
                 </div>
                 {config.detectors.active.length === 0 ? (
                   <p className="px-5 py-4 text-sm text-slate-500 dark:text-slate-400">
@@ -247,21 +238,14 @@ export default function SettingsPanel() {
               </section>
 
               <section className="rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900/70">
-                <div className="border-b border-slate-200 px-5 py-3 dark:border-slate-800">
+                <div className="flex items-center gap-1.5 border-b border-slate-200 px-5 py-3 dark:border-slate-800">
                   <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                     All bundled detectors
                   </h2>
-                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                    Inactive entries are excluded by{" "}
-                    <code className="rounded bg-slate-100 px-1 text-[11px] dark:bg-slate-900">
-                      FILTER_DETECTORS
-                    </code>
-                    . Set it to{" "}
-                    <code className="rounded bg-slate-100 px-1 text-[11px] dark:bg-slate-900">
-                      auto
-                    </code>{" "}
-                    to re-enable everything.
-                  </p>
+                  <InfoHint
+                    side="right"
+                    text="Every detector shipped with the worker. Inactive entries are excluded by the FILTER_DETECTORS env var; set it to 'auto' to re-enable everything."
+                  />
                 </div>
                 {config.detectors.available.length === 0 ? (
                   <p className="px-5 py-4 text-sm text-slate-500 dark:text-slate-400">

@@ -6,35 +6,66 @@ records accept/reject feedback that becomes future training data.
 
 ## What it does
 
-- Lists every session the worker has produced (newest first).
-- Renders the LangGraph output: filtered logs, suggested fix, similar past
-  failures with their kNN scores.
-- Surfaces the structural filter's *Detected* panel on each failure card —
-  confidence badge, activated detector chips, primary file:line anchor,
-  and compression ratio. See [`filtering.md`](filtering.md).
-- Hosts the conversational assistant (`ChatPanel`) — every message round-
-  trips through the backend → worker `/chat/turn` endpoint.
+The UI is split into two pages: a **main Overview dashboard** (`/`) and a
+focused **Root Cause Analysis** page (`/rca?run=<run_id>`).
+
+**Overview (`/`)** — the landing page, for scanning the fleet of failures:
+
+- Shows a summary **matrix** (total failures, accepted, rejected, unresolved)
+  plus an **error-class breakdown**, all derived from the currently-filtered
+  set.
+- A **filter bar**: free-text search (job / stage / error class / signature),
+  date-range presets (Today / Yesterday / This Week / Last Week) or a custom
+  From–To range, and a status filter (unresolved / accepted / rejected). The
+  matrix, the breakdown badges, and the table all stay in sync with the same
+  predicate.
+- A **table of failed stages**, grouped by build (newest first). Clicking a
+  row opens that failure's RCA page.
+- An **Overview ⇄ Knowledge Map** toggle. The Knowledge Map visualizes the
+  accepted-solutions corpus and its similarity links.
+- A **Refresh / Auto-poll** control that proxies to the listener.
+
+**Root Cause Analysis (`/rca?run=<run_id>`)** — the drill-in for one failure:
+
+- Renders the LangGraph output: analysis, suggested fix, filtered log excerpt.
+- Surfaces the structural filter's *Detected* panel — confidence badge,
+  activated detector chips, primary file:line anchor, and compression ratio.
+  See [`filtering.md`](filtering.md).
+- Hosts the conversational assistant (`ChatPanel`).
 - Lets the user accept or reject the suggested fix; accepting triggers the
   backend to write the solution to Elasticsearch via the worker.
-- Provides a “Refresh / Auto-poll” control that proxies to the listener.
-- Exposes a **Settings** page (`/settings`) that surfaces the live filter
-  configuration: detector inventory, token/character budgets, and the
-  env var that controls each knob. Read-only — changes still require
-  editing `.env` and restarting the worker.
+- A **Back to dashboard** button returns to the Overview.
+
+**Settings (`/settings`)** — read-only view of the live filter configuration:
+detector inventory, token/character budgets, and the env var that controls
+each knob. Changes still require editing `.env` and restarting the worker.
+
+Throughout the UI, long explainer paragraphs have been replaced with hover
+**ⓘ info icons** (`components/ui/info-hint.tsx`) to keep the surface clean.
 
 ## Logic flow
 
 ```
-URL ?session=<uuid>
+/  (Overview)
         │
         ▼
-app/page.tsx ──fetch──► web-backend GET /api/sessions/<uuid>
+app/page.tsx ──► <MainDashboard>
+        │            │  fetch ──► web-backend GET /api/results   (failed stages)
+        │            │  fetch ──► web-backend GET /api/diagnostics
+        │            │  poll  ──► web-backend POST /api/listener/poll-once
+        │            ├─► <StatsBar>        matrix + error breakdown (client-derived)
+        │            ├─► <FilterBar>       search · date range · status
+        │            ├─► <FailuresTable>   build-grouped rows → /rca?run=<run_id>
+        │            └─► <KnowledgeMap>    GET /api/knowledge-graph (toggle)
+        ▼
+/rca?run=<run_id>
         │
-        ├─► <Dashboard>           list view + selection
-        ├─► <FailureCard>         analysis + suggested fix
-        │       └─► <FilterMetaPanel>   detector chips + confidence + location
-        ├─► <ChatPanel>           POST /api/sessions/<id>/chat
-        ├─► <StatsBar>            kNN match metadata
+        ▼
+app/rca/page.tsx ──► <RcaView>
+        │                fetch ──► web-backend GET /api/results (find run_id)
+        ├─► <FailureCard>        analysis + suggested fix
+        │       └─► <FilterMetaPanel>  detector chips + confidence + location
+        ├─► <ChatPanel>          POST /agent/chat  ·  GET /api/sessions/<id>
         └─► feedback buttons ──► POST /api/sessions/<id>/feedback
 
 /settings

@@ -180,7 +180,7 @@ def _register_web_sessions(rows: list[dict[str, Any]]) -> None:
                 sid = data.get("id")
                 if sid:
                     row["web_session_id"] = sid
-                    row["web_session_url"] = f"{pub}/?session={sid}"
+                    row["web_session_url"] = f"{pub}/rca?run={sid}"
                     logger.info("Web UI session: %s", row["web_session_url"])
             except Exception:
                 logger.warning("Web UI session hook failed", exc_info=True)
