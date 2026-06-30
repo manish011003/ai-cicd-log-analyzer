@@ -12,8 +12,10 @@ Jenkins ─► jenkins_failure_listener ─► failure_analyzer_worker ─► El
 ```
 
 The full architecture, per-feature walkthroughs, and operational reference
-live under [`docs/`](docs/README.md). Start with
-[`docs/architecture.md`](docs/architecture.md) for the 30-second tour.
+live under [`docs/`](docs/README.md). New operators should follow
+[`docs/getting-started.md`](docs/getting-started.md) — a linear runbook
+that goes from `git clone` to a stored, accepted solution. For the
+30-second internals tour read [`docs/architecture.md`](docs/architecture.md).
 
 ---
 

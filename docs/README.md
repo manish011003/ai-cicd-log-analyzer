@@ -1,10 +1,14 @@
 # Documentation index
 
-Start with [`architecture.md`](architecture.md) for the 30-second tour, then
-drop into the per-feature page that matches what you’re working on.
+New to the project? Start with [`getting-started.md`](getting-started.md)
+— a linear runbook from cloning the repo to seeing your first analysis
+in the dashboard. Then read [`architecture.md`](architecture.md) for the
+30-second internals tour, and drop into the per-feature page that
+matches what you're working on.
 
 | Document                                                       | What it covers                                              |
 | -------------------------------------------------------------- | ----------------------------------------------------------- |
+| [getting-started.md](getting-started.md)                       | End-to-end deploy + first-analysis runbook                  |
 | [architecture.md](architecture.md)                             | Service map, data stores, request lifecycle                 |
 | [folder-structure.md](folder-structure.md)                     | Why the repo is laid out the way it is                      |
 | [failure-analyzer-worker.md](failure-analyzer-worker.md)       | LangGraph + Groq + ES worker (port 8090)                    |
